@@ -11,6 +11,7 @@ import { formatTabTitle, normalizeHttpUrl } from './url'
 
 const tabs = ref<RequestTab[]>([createTab()])
 const activeId = ref(tabs.value[0]!.id)
+const workspace = ref<HTMLElement | null>(null)
 const tabsNav = ref<HTMLElement | null>(null)
 const tabsOverflow = ref(false)
 const tabsCanScrollLeft = ref(false)
@@ -28,16 +29,18 @@ let tabAutoScrollPending = false
 let sessionSaveTimer = 0
 let sessionSaveQueue: Promise<void> = Promise.resolve()
 let historySaveQueue: Promise<void> = Promise.resolve()
-const split = ref(50)
+const split = computed(() => activeTab.value.requestWidthPercent)
 const theme = ref<'system' | 'light' | 'dark'>('system')
 type FontSize = 'small' | 'normal' | 'large' | 'xlarge'
 type UiSettings = { version: 1; appearance: { theme: 'system' | 'light' | 'dark'; fontSize: FontSize; sourceFontSize: number | null }; historyLimit: number }
 type SettingsLoadResult = { settings: UiSettings; migrated: boolean; warning: string | null }
 type StoredRequest = Pick<RequestTab, 'method' | 'url' | 'timeoutMs' | 'params' | 'headers' | 'auth' | 'body'> & { saveBodyContent: boolean; needsSensitiveReview: boolean; bodyContentSaved: boolean }
 type HistoryEntry = { id: string; executedAt: string; request: StoredRequest }
-type SessionEntry = { id: string; historyId: string | null; recordHistory: boolean; request: StoredRequest }
+type SessionEntry = { id: string; historyId: string | null; recordHistory: boolean; requestWidthPercent: number; request: StoredRequest }
 type JsonLoad<T> = { value: T; warning: string | null }
 const HISTORY_LIMITS = [100, 500, 1_000, 5_000, 10_000]
+const MIN_SPLIT_PERCENT = 15
+const MAX_SPLIT_PERCENT = 85
 const FONT_SIZES: Array<{ value: FontSize; label: string; pixels: number }> = [
   { value: 'small', label: 'Small', pixels: 14 },
   { value: 'normal', label: 'Normal', pixels: 16 },
@@ -217,6 +220,12 @@ function cloneData<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T
 }
 
+function validSplitPercent(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= MIN_SPLIT_PERCENT && value <= MAX_SPLIT_PERCENT
+    ? Math.round(value * 10) / 10
+    : 50
+}
+
 async function loadHistory() {
   try {
     const result = await invoke<JsonLoad<{ version: number; entries: HistoryEntry[] }>>('load_history')
@@ -239,6 +248,7 @@ function scheduleSessionSave() {
 function queueSessionSave(showError: boolean) {
   const sessionTabs: SessionEntry[] = tabs.value.map((tab) => ({
     id: tab.id, historyId: tab.historyId, recordHistory: tab.recordHistory,
+    requestWidthPercent: Math.round(tab.requestWidthPercent * 10) / 10,
     request: snapshotRequest(tab) as StoredRequest,
   }))
   const selected = activeId.value
@@ -265,7 +275,7 @@ async function loadSession() {
         ...createTab(), id: saved.id, method: saved.request.method, url: saved.request.url,
         timeoutMs: saved.request.timeoutMs, params: saved.request.params, headers: saved.request.headers,
         auth: saved.request.auth, body: saved.request.body,
-        recordHistory: saved.recordHistory, saveBodyContent: saved.request.saveBodyContent,
+        recordHistory: saved.recordHistory, requestWidthPercent: validSplitPercent(saved.requestWidthPercent), saveBodyContent: saved.request.saveBodyContent,
         needsSensitiveReview: saved.request.needsSensitiveReview, historyId: saved.historyId,
         requestState: 'idle', executionId: null, response: null, requestError: null, responseAt: null,
       }))
@@ -478,20 +488,25 @@ function handleGlobalWheel(event: WheelEvent) {
 }
 function dragSplit(event: PointerEvent) {
   const grid = event.currentTarget as HTMLElement
-  const bounds = grid.parentElement?.getBoundingClientRect()
+  const bounds = workspace.value?.getBoundingClientRect()
   if (!bounds) return
   const move = (pointer: PointerEvent) => {
-    const ratio = ((pointer.clientX - bounds.left) / bounds.width) * 100
-    split.value = Math.min(68, Math.max(32, ratio))
+    const availableWidth = Math.max(1, bounds.width - 8)
+    const ratio = ((pointer.clientX - bounds.left - 4) / availableWidth) * 100
+    activeTab.value.requestWidthPercent = Math.round(Math.min(MAX_SPLIT_PERCENT, Math.max(MIN_SPLIT_PERCENT, ratio)) * 10) / 10
   }
   const stop = () => {
     window.removeEventListener('pointermove', move)
     window.removeEventListener('pointerup', stop)
     grid.releasePointerCapture(event.pointerId)
+    scheduleSessionSave()
   }
   grid.setPointerCapture(event.pointerId)
   window.addEventListener('pointermove', move)
   window.addEventListener('pointerup', stop, { once: true })
+}
+function nudgeSplit(direction: -1 | 1) {
+  activeTab.value.requestWidthPercent = Math.round(Math.min(MAX_SPLIT_PERCENT, Math.max(MIN_SPLIT_PERCENT, split.value + direction * 2)) * 10) / 10
 }
 function cycleTheme() { theme.value = theme.value === 'system' ? 'light' : theme.value === 'light' ? 'dark' : 'system' }
 function closeSettingsOnOutsidePointer(event: PointerEvent) {
@@ -617,6 +632,7 @@ onMounted(() => {
   watch(() => tabs.value.map((tab) => ({
     id: tab.id, historyId: tab.historyId, recordHistory: tab.recordHistory,
     method: tab.method, url: tab.url, timeoutMs: tab.timeoutMs,
+    requestWidthPercent: tab.requestWidthPercent,
     params: tab.params, headers: tab.headers, auth: tab.auth, body: tab.body,
     saveBodyContent: tab.saveBodyContent,
   })), scheduleSessionSave, { deep: true })
@@ -709,7 +725,7 @@ onBeforeUnmount(() => {
         </div>
         <div class="history-actions"><button @click="clearHistory('today')">清除今天</button><button @click="clearHistory('older7')">清除 7 天以前</button><button @click="clearHistory('older30')">清除 30 天以前</button><button class="history-clear-all" @click="clearHistory('all')">清除全部 History</button></div>
       </aside>
-      <section class="workspace" :class="{ 'workspace-with-history': historyOpen }" :style="{ gridTemplateColumns: `minmax(0, ${split}fr) 8px minmax(0, ${100 - split}fr)` }">
+      <section ref="workspace" class="workspace" :class="{ 'workspace-with-history': historyOpen }" :style="{ gridTemplateColumns: `minmax(0, ${split}fr) 8px minmax(0, ${100 - split}fr)` }">
       <section class="pane request-pane" aria-label="Request 編輯器">
         <div class="pane-heading"><div><span class="pane-dot request-dot"></span><h1>Request</h1></div><div class="request-pane-options"><label class="record-history-option"><input v-model="activeTab.recordHistory" type="checkbox" />History</label><label class="timeout-label"><span>Timeout</span><input v-model.number="activeTab.timeoutMs" type="number" min="100" max="600000" step="1000" aria-label="Timeout 毫秒" /><span class="timeout-unit">ms</span></label></div></div>
         <div class="section-tabs">
@@ -758,7 +774,7 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
-      <div class="splitter" role="separator" aria-label="調整 Request 與 Response 寬度" aria-orientation="vertical" @pointerdown="dragSplit" @keydown.left.prevent="split = Math.max(32, split - 2)" @keydown.right.prevent="split = Math.min(68, split + 2)" tabindex="0"><span></span></div>
+      <div class="splitter" role="separator" aria-label="調整 Request 與 Response 寬度" aria-orientation="vertical" @pointerdown="dragSplit" @keydown.left.prevent="nudgeSplit(-1)" @keydown.right.prevent="nudgeSplit(1)" tabindex="0"><span></span></div>
 
       <section class="pane response-pane" aria-label="Response 檢視器">
         <div class="pane-heading"><div><span class="pane-dot response-dot"></span><h1>Response</h1></div><div class="response-toolbar">

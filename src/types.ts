@@ -39,6 +39,7 @@ export interface RequestTab {
   headers: KeyValue[]
   auth: AuthConfig
   body: RequestBody
+  requestWidthPercent: number
   recordHistory: boolean
   saveBodyContent: boolean
   needsSensitiveReview: boolean
@@ -89,6 +90,7 @@ export function createTab(): RequestTab {
     params: [], headers: [],
     auth: { kind: 'none', username: '', password: '', token: '', key: '', value: '', location: 'header' },
     body: { kind: 'none', text: '', fields: [] },
+    requestWidthPercent: 50,
     recordHistory: true, saveBodyContent: true, needsSensitiveReview: false, historyId: null,
     requestState: 'idle', executionId: null, response: null, requestError: null, responseAt: null,
   }

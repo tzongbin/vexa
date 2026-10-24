@@ -46,6 +46,7 @@ Vexa 是 **Local-first、輕量、跨平台的桌面 HTTP/API 測試工具**。�
 - Request 執行期間切換 Tab，不得將完成結果寫入其他 Tab。
 - 調整 Request 不自動清空前次 Response；UI 應標示 Response 對應的執行時間或狀態。
 - 自動保存各 Tab 的 Request 設定、順序及最後作用中的 Tab；程式重新開啟時還原。
+- 每個 Tab 獨立保存 Request / Response 分割比例於加密 Session；新 Tab 與舊 Session 缺少欄位時預設 50%，History 不保存比例。
 - **Tab 的 Response 只保留於當次執行記憶體，不跨重啟還原。**
 - 關閉最後一個 Tab 時建立空白 Tab。
 - 對於尚在執行的 Request，須有一致的取消、關閉或完成結果處理方式。
@@ -94,6 +95,7 @@ Vexa 是 **Local-first、輕量、跨平台的桌面 HTTP/API 測試工具**。�
 
 - 優先桌面寬螢幕；主要介面為 Tab Bar + 左側 Request + 右側 Response。
 - Request / Response 左右分割比例可拖曳調整，雙側各自獨立捲動。
+- 視窗縮放時依目前可用寬度暫時限制分割顯示比例，不能覆寫各 Tab 保存的分割偏好。
 - History 面板可開關，預設不佔用主要工作畫面；不要加上 Collection Sidebar。
 - 清楚區分未送出、執行中、成功、HTTP 錯誤、網路錯誤與取消狀態。
 - 不因加入次要功能增加常用 Send 流程的操作步驟。

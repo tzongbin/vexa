@@ -99,7 +99,7 @@ Windows 應用使用 WebView2；Tauri 設定會在安裝包流程加入 Evergree
 - AES-256-GCM 加密 History 與 Session：完整保存 Request 與文字 Body，保留執行快照、History 筆數上限與清除功能；Response 不持久化。v0.2.0 明文資料首次讀取時安全遷移，`secret.key` 隨 Portable `Data` 搬移。
 - History 預設上限 1,000，可選 100/500/1,000/5,000/10,000，超限淘汰最舊資料。每筆加密保存的 Request 上限 1 MiB；每個 JSON 資料檔上限 32 MiB。
 - History 可搜尋 URL、篩選 Method、依日期分組、分批顯示及清除全部/今天/7 天以前/30 天以前。點選記錄會開新 Tab，不會重新送出；已開啟的記錄會切換至既有 Tab。
-- Session 以 Debounce 保存 Tabs、順序、作用中的 Tab 與 Request；重新啟動後還原 Request，但所有 Response 保持空白。
+- Session 以 Debounce 保存 Tabs、順序、作用中的 Tab、Request 與各 Tab 的 Request / Response 分割比例；重新啟動後還原 Request 和分割比例，但所有 Response 保持空白。舊 Session 缺少比例欄位時使用 50%。
 - History / Session 的 Request 與 Body 以 AES-256-GCM 加密保存。舊版已遮罩欄位仍需重新輸入並在送出前確認；Multipart 檔案路徑加密保存但不攜帶檔案內容。
 - GET、POST、PUT、PATCH、DELETE、HEAD、OPTIONS。
 - URL Query、重複 Key/Headers、欄位啟用/停用。

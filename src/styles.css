@@ -99,11 +99,11 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .workspace { display: grid; flex: 1; min-height: 0; overflow: hidden; }
 .pane { min-width: 0; min-height: 0; display: flex; flex-direction: column; background: var(--app-bg); overflow: hidden; }
 .request-pane { border-right: 0; }.response-pane { border-left: 0; }
-.pane-heading { height: 48px; flex: 0 0 48px; display: flex; align-items: center; justify-content: space-between; padding: 0 18px; border-bottom: 1px solid var(--border); }
+.pane-heading { height: 48px; flex: 0 0 48px; display: flex; align-items: center; justify-content: space-between; min-width: 0; overflow-x: auto; overflow-y: hidden; padding: 0 18px; border-bottom: 1px solid var(--border); scrollbar-width: thin; }
 .pane-heading > div:first-child { display: flex; align-items: center; gap: 9px; }.pane-heading h1 { margin: 0; font-size: calc(13px * var(--ui-scale)); font-weight: 600; letter-spacing: .2px; }
 .pane-dot { width: 7px; height: 7px; border-radius: 2px; transform: rotate(45deg); }.request-dot { background: var(--blue); }.response-dot { background: var(--accent); }
 .timeout-label { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 6px; color: var(--muted); font-size: calc(11px * var(--ui-scale)); white-space: nowrap; }.timeout-label input { box-sizing: content-box; width: 8ch; min-width: 8ch; flex: 0 0 auto; margin: 0; padding: 3px 1px; border: 0; border-bottom: 1px solid var(--border-strong); background: transparent; color: var(--text-secondary); font: calc(11px * var(--ui-scale)) var(--mono); text-align: right; }.timeout-unit { flex: 0 0 auto; }
-.section-tabs, .response-tabs { display: flex; height: 40px; flex: 0 0 40px; align-items: stretch; gap: 18px; padding: 0 18px; border-bottom: 1px solid var(--border); }
+.section-tabs, .response-tabs { display: flex; height: 40px; flex: 0 0 40px; align-items: stretch; gap: 18px; overflow-x: auto; overflow-y: hidden; padding: 0 18px; border-bottom: 1px solid var(--border); scrollbar-width: thin; }
 .section-tabs button, .response-tabs button, .body-view-tabs button { position: relative; padding: 0 1px; border: 0; background: transparent; color: var(--muted); font-size: calc(12px * var(--ui-scale)); }
 .section-tabs button.selected, .response-tabs button.selected, .body-view-tabs button.selected { color: var(--text); }
 .section-tabs button.selected::after, .response-tabs button.selected::after, .body-view-tabs button.selected::after { content: ''; position: absolute; right: 0; bottom: -1px; left: 0; height: 2px; background: var(--accent); }

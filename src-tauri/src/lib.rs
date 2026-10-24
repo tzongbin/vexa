@@ -39,6 +39,39 @@ const MAX_HISTORY_ENTRIES: usize = 10_000;
 const MAX_JSON_STORE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PERSISTED_REQUEST_BYTES: usize = 1024 * 1024;
 const HISTORY_LIMITS: [usize; 5] = [100, 500, 1_000, 5_000, 10_000];
+const DEFAULT_REQUEST_WIDTH_PERCENT: f64 = 50.0;
+const MIN_REQUEST_WIDTH_PERCENT: f64 = 15.0;
+const MAX_REQUEST_WIDTH_PERCENT: f64 = 85.0;
+
+fn default_request_width_percent() -> f64 {
+    DEFAULT_REQUEST_WIDTH_PERCENT
+}
+
+fn deserialize_request_width_percent<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?
+        .as_f64()
+        .unwrap_or(DEFAULT_REQUEST_WIDTH_PERCENT);
+    Ok(if valid_request_width_percent(value) {
+        value
+    } else {
+        DEFAULT_REQUEST_WIDTH_PERCENT
+    })
+}
+
+fn valid_request_width_percent(value: f64) -> bool {
+    value.is_finite() && (MIN_REQUEST_WIDTH_PERCENT..=MAX_REQUEST_WIDTH_PERCENT).contains(&value)
+}
+
+fn checked_request_width_percent(value: f64) -> Result<f64, String> {
+    if valid_request_width_percent(value) {
+        Ok((value * 10.0).round() / 10.0)
+    } else {
+        Err("Session 分割比例必須介於 15% 至 85%。".into())
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -430,21 +463,28 @@ struct PersistedRequest {
     body_content_saved: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SessionTabInput {
     id: String,
     history_id: Option<String>,
     record_history: bool,
+    #[serde(default = "default_request_width_percent")]
+    request_width_percent: f64,
     request: RequestSnapshotInput,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SessionTab {
     id: String,
     history_id: Option<String>,
     record_history: bool,
+    #[serde(
+        default = "default_request_width_percent",
+        deserialize_with = "deserialize_request_width_percent"
+    )]
+    request_width_percent: f64,
     request: PersistedRequest,
 }
 
@@ -472,7 +512,7 @@ impl Default for HistoryFile {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SessionFile {
     version: u32,
@@ -641,10 +681,11 @@ fn validate_history_file(history: &HistoryFile) -> bool {
 fn validate_session_file(session: &SessionFile) -> bool {
     session.version == JSON_STORE_VERSION
         && !session.tabs.is_empty()
-        && session
-            .tabs
-            .iter()
-            .all(|tab| !tab.id.is_empty() && valid_persisted_request(&tab.request))
+        && session.tabs.iter().all(|tab| {
+            !tab.id.is_empty()
+                && valid_request_width_percent(tab.request_width_percent)
+                && valid_persisted_request(&tab.request)
+        })
         && session
             .tabs
             .iter()
@@ -1338,6 +1379,7 @@ async fn save_session(
                 id: tab.id,
                 history_id: tab.history_id,
                 record_history: tab.record_history,
+                request_width_percent: checked_request_width_percent(tab.request_width_percent)?,
                 request: persist_request(&tab.request)?,
             });
         }
@@ -2088,6 +2130,70 @@ mod tests {
     }
 
     #[test]
+    fn session_split_percent_defaults_old_and_invalid_values_and_rejects_invalid_writes() {
+        let session = SessionFile {
+            version: JSON_STORE_VERSION,
+            tabs: vec![SessionTab {
+                id: "split-tab".into(),
+                history_id: None,
+                record_history: true,
+                request_width_percent: 65.0,
+                request: persist_request(&request_snapshot(true)).unwrap(),
+            }],
+            active_tab_id: "split-tab".into(),
+        };
+
+        let mut old_session = serde_json::to_value(&session).unwrap();
+        old_session["tabs"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("requestWidthPercent");
+        let old_session: SessionFile = serde_json::from_value(old_session).unwrap();
+        assert_eq!(
+            old_session.tabs[0].request_width_percent,
+            DEFAULT_REQUEST_WIDTH_PERCENT
+        );
+
+        for invalid in [
+            serde_json::Value::String("NaN".into()),
+            serde_json::Value::Null,
+        ] {
+            let mut invalid_session = serde_json::to_value(&session).unwrap();
+            invalid_session["tabs"][0]["requestWidthPercent"] = invalid;
+            let invalid_session: SessionFile = serde_json::from_value(invalid_session).unwrap();
+            assert_eq!(
+                invalid_session.tabs[0].request_width_percent,
+                DEFAULT_REQUEST_WIDTH_PERCENT
+            );
+        }
+
+        for invalid in [-1.0, 0.0, 14.9, 85.1, 100.0] {
+            let mut invalid_session = serde_json::to_value(&session).unwrap();
+            invalid_session["tabs"][0]["requestWidthPercent"] = invalid.into();
+            let invalid_session: SessionFile = serde_json::from_value(invalid_session).unwrap();
+            assert_eq!(
+                invalid_session.tabs[0].request_width_percent,
+                DEFAULT_REQUEST_WIDTH_PERCENT
+            );
+        }
+
+        for valid in [15.0, 32.0, 35.0, 50.0, 65.0, 68.0, 85.0] {
+            assert_eq!(checked_request_width_percent(valid).unwrap(), valid);
+            let mut compatible_session = serde_json::to_value(&session).unwrap();
+            compatible_session["tabs"][0]["requestWidthPercent"] = valid.into();
+            let compatible_session: SessionFile =
+                serde_json::from_value(compatible_session).unwrap();
+            assert!(validate_session_file(&compatible_session));
+            assert_eq!(compatible_session.tabs[0].request_width_percent, valid);
+        }
+        assert_eq!(checked_request_width_percent(65.04).unwrap(), 65.0);
+        assert_eq!(checked_request_width_percent(65.06).unwrap(), 65.1);
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 14.9, 85.1] {
+            assert!(checked_request_width_percent(invalid).is_err());
+        }
+    }
+
+    #[test]
     fn history_and_session_retain_complete_request_values_for_encryption() {
         let saved = persist_request(&request_snapshot(false)).unwrap();
         assert!(!saved.needs_sensitive_review);
@@ -2177,6 +2283,7 @@ mod tests {
                 id: "tab-one".into(),
                 history_id: Some("one".into()),
                 record_history: true,
+                request_width_percent: 50.0,
                 request,
             }],
             active_tab_id: "tab-one".into(),
@@ -2292,6 +2399,7 @@ mod tests {
                 id: "new-tab".into(),
                 history_id: None,
                 record_history: true,
+                request_width_percent: 50.0,
                 request: history.entries[0].request.clone(),
             }],
             active_tab_id: "new-tab".into(),
@@ -2356,6 +2464,7 @@ mod tests {
                 id: "tab-portable".into(),
                 history_id: None,
                 record_history: true,
+                request_width_percent: 50.0,
                 request: history.entries[0].request.clone(),
             }],
             active_tab_id: "tab-portable".into(),
@@ -2446,6 +2555,7 @@ mod tests {
                 id: "too-large-tab".into(),
                 history_id: None,
                 record_history: true,
+                request_width_percent: 50.0,
                 request: rejected_request,
             }],
             active_tab_id: "too-large-tab".into(),
@@ -2473,6 +2583,7 @@ mod tests {
                 id: "retry-tab".into(),
                 history_id: None,
                 record_history: false,
+                request_width_percent: 50.0,
                 request,
             }],
             active_tab_id: "retry-tab".into(),

@@ -141,6 +141,26 @@ function tabByTitle(page, title) {
   return page.locator('.tabs .tab').filter({ hasText: title })
 }
 
+async function paneRatio(page) {
+  return page.locator('.workspace').evaluate((workspace) => {
+    const request = workspace.querySelector('.request-pane').getBoundingClientRect()
+    return request.width / (workspace.getBoundingClientRect().width - 8) * 100
+  })
+}
+
+async function dragSplitToRatio(page, ratio) {
+  const workspace = await page.locator('.workspace').boundingBox()
+  const splitter = await page.locator('.splitter').boundingBox()
+  assert(workspace && splitter, 'the Request/Response splitter should be visible')
+  const startX = splitter.x + splitter.width / 2
+  const y = splitter.y + Math.min(30, splitter.height / 2)
+  const endX = workspace.x + ((workspace.width - 8) * ratio / 100) + 4
+  await page.mouse.move(startX, y)
+  await page.mouse.down()
+  await page.mouse.move(endX, y, { steps: 5 })
+  await page.mouse.up()
+}
+
 async function stopApp() {
   const processToStop = child
   child = undefined
@@ -288,10 +308,12 @@ try {
   assert.equal(JSON.stringify(savedHistory).includes('vexa-smoke-token-never-persist'), false)
   assert.equal(JSON.stringify(savedHistory).includes('vexa-smoke-body-never-persist'), false)
   await page.getByRole('button', { name: 'History' }).click()
+  await dragSplitToRatio(page, 62)
   const beforeHistoryOpen = requestCounts.get('/json') ?? 0
   const tabCountBeforeHistory = await page.locator('.tabs .tab').count()
   await page.locator('.history-entry').first().click()
   await page.waitForFunction(() => document.querySelector('.response-empty'))
+  assert(Math.abs(await paneRatio(page) - 50) < 1.5, 'opening a History Request should create a 50% Tab')
   assert.equal(requestCounts.get('/json') ?? 0, beforeHistoryOpen, 'opening a History item must not send it')
   assert.equal(await page.locator('.tabs .tab').count(), tabCountBeforeHistory + 1)
   await page.getByRole('button', { name: 'Auth', exact: true }).click()
@@ -442,7 +464,19 @@ try {
   await page.locator('.theme-toggle').click()
   const persisted = await waitForSettings(settingsPath, (settings) => settings.appearance.fontSize === 'xlarge' && settings.appearance.sourceFontSize === 15 && settings.appearance.theme === 'system')
   assert.deepEqual(persisted.appearance, { theme: 'system', fontSize: 'xlarge', sourceFontSize: 15 })
-  const expectedActiveTabId = await page.locator('.tabs .tab-active').getAttribute('data-tab-id')
+  const splitTabIds = await page.locator('.tabs .tab').evaluateAll((items) => items.slice(0, 2).map((item) => item.getAttribute('data-tab-id')))
+  assert(splitTabIds.length === 2 && splitTabIds[0] && splitTabIds[1], 'the split persistence test needs two Tabs')
+  await page.locator(`.tab[data-tab-id="${splitTabIds[0]}"]`).click()
+  await dragSplitToRatio(page, 15)
+  assert(Math.abs(await paneRatio(page) - 15) < 1.5, 'first Tab should display its 15% Request preference')
+  await page.locator(`.tab[data-tab-id="${splitTabIds[1]}"]`).click()
+  await dragSplitToRatio(page, 85)
+  assert(Math.abs(await paneRatio(page) - 85) < 1.5, 'second Tab should display its 85% Request preference')
+  await page.locator(`.tab[data-tab-id="${splitTabIds[0]}"]`).click()
+  assert(Math.abs(await paneRatio(page) - 15) < 1.5, 'switching Tabs should restore the first split preference')
+  await page.locator(`.tab[data-tab-id="${splitTabIds[1]}"]`).click()
+  assert(Math.abs(await paneRatio(page) - 85) < 1.5, 'switching Tabs should restore the second split preference')
+  const expectedActiveTabId = splitTabIds[1]
   const expectedTabCount = await page.locator('.tabs .tab').count()
   const previousSessionBytes = await readFile(sessionPath)
   const otherTabId = await page.locator('.tabs .tab').evaluateAll((items, activeId) => items.find((item) => item.getAttribute('data-tab-id') !== activeId)?.getAttribute('data-tab-id'), expectedActiveTabId)
@@ -465,6 +499,10 @@ try {
   assert.equal(await page.locator('.app-shell').getAttribute('data-font-size'), 'xlarge')
   assert.equal(await page.locator('.app-shell').getAttribute('data-theme'), 'system')
   await page.waitForFunction(({ count, id }) => document.querySelectorAll('.tabs .tab').length === count && document.querySelector('.tabs .tab-active')?.getAttribute('data-tab-id') === id, { count: expectedTabCount, id: expectedActiveTabId })
+  assert(Math.abs(await paneRatio(page) - 85) < 1.5, 'the restarted EXE should restore the active Tab split preference')
+  await page.locator(`.tab[data-tab-id="${splitTabIds[0]}"]`).click()
+  assert(Math.abs(await paneRatio(page) - 15) < 1.5, 'the restarted EXE should restore the other Tab split preference')
+  await page.locator(`.tab[data-tab-id="${expectedActiveTabId}"]`).click()
   assert.equal(await page.getByLabel('Request URL').inputValue(), expectedActiveUrl)
   await page.locator('.response-empty').waitFor({ state: 'visible' })
   const bearerTab = page.locator('.tabs .tab').filter({ hasText: new RegExp(`POST 127\\.0\\.0\\.1:${appPort}/json`) }).first()
@@ -580,6 +618,7 @@ try {
   launchApp()
   page = await connectAppPage()
   await page.waitForFunction(() => document.querySelector('.tabs .tab')?.textContent?.includes('POST 127.0.0.1:') && document.querySelector('.tabs .tab')?.textContent?.includes('/json'))
+  assert(Math.abs(await paneRatio(page) - 50) < 1.5, 'a legacy Session without a split field should use 50%')
   const migratedHistory = JSON.parse(await readFile(resolve(legacyDirectory, 'Data/history.json'), 'utf8'))
   const migratedSession = JSON.parse(await readFile(resolve(legacyDirectory, 'Data/session.json'), 'utf8'))
   assert.equal(migratedHistory.algorithm, 'AES-256-GCM')

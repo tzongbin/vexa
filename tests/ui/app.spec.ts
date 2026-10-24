@@ -101,7 +101,8 @@ async function installTauriMock(page: Page) {
           return undefined
         }
         if (command === 'load_session') {
-          return { value: JSON.parse(sessionStorage.getItem('__vexa_session') ?? '{"version":1,"tabs":[],"activeTabId":""}'), warning: null }
+          const override = sessionStorage.getItem('__vexa_session_override')
+          return { value: JSON.parse(override ?? sessionStorage.getItem('__vexa_session') ?? '{"version":1,"tabs":[],"activeTabId":""}'), warning: null }
         }
         if (command === 'save_session') {
           sessionStorage.setItem('__vexa_session', JSON.stringify({ version: 1, tabs: args.tabs, activeTabId: args.activeTabId }))
@@ -858,6 +859,7 @@ test('URL Enter and Ctrl+Enter send, body Enter and IME composition do not', asy
 })
 
 test('History records repeated sends, opens a new unsent Tab, and clearing leaves Tabs open', async ({ page }) => {
+  await dragSplitterToRatio(page, 64)
   await page.getByLabel('Request URL').fill('http://mock/fast')
   await page.getByRole('button', { name: 'Auth', exact: true }).click()
   await page.locator('.request-pane').getByLabel('類型').selectOption('bearer')
@@ -870,6 +872,7 @@ test('History records repeated sends, opens a new unsent Tab, and clearing leave
   const stored = await page.evaluate(() => JSON.parse(sessionStorage.getItem('__vexa_history') ?? '[]')[0].request)
   expect(stored.auth.token).toBe('fixture-history-token')
   expect(stored.body.text).toBe('{"fixture":"history-body"}')
+  expect(JSON.stringify(await page.evaluate(() => JSON.parse(sessionStorage.getItem('__vexa_history') ?? '[]')))).not.toContain('requestWidthPercent')
   await page.getByRole('button', { name: /Send/ }).click()
   await expect.poll(() => page.evaluate(() => JSON.parse(sessionStorage.getItem('__vexa_history') ?? '[]').length)).toBe(2)
 
@@ -879,6 +882,7 @@ test('History records repeated sends, opens a new unsent Tab, and clearing leave
   const tabsBeforeOpen = await page.locator('.tabs .tab').count()
   await page.locator('.history-entry').first().click()
   await expect(page.locator('.tabs .tab')).toHaveCount(tabsBeforeOpen + 1)
+  await expect.poll(() => paneRatio(page)).toBeCloseTo(50, 0)
   await expect(page.locator('.response-empty')).toBeVisible()
   expect(await page.evaluate(() => window.__VEXA_TEST__.sent.length)).toBe(sendsBeforeOpen)
   await page.getByRole('button', { name: 'Auth', exact: true }).click()
@@ -912,6 +916,129 @@ test('Session debounces Request edits, restores tab order and selection without 
   await expect(page.locator('.tabs .tab')).toHaveCount(1)
   await expect(page.getByLabel('Request URL')).toHaveValue('http://mock/fast')
 })
+
+test('Session stores and restores an independent split preference for every Tab', async ({ page }) => {
+  await expect.poll(() => paneRatio(page)).toBeCloseTo(50, 0)
+  await dragSplitterToRatio(page, 15)
+  await expect.poll(() => paneRatio(page)).toBeCloseTo(15, 0)
+  await dragSplitterToRatio(page, 5)
+  await expect.poll(() => paneRatio(page)).toBeCloseTo(15, 0)
+  const firstTabId = await page.locator('.tab-active').getAttribute('data-tab-id')
+
+  await page.getByRole('button', { name: '新增 Tab' }).click()
+  await expect.poll(() => paneRatio(page)).toBeCloseTo(50, 0)
+  await dragSplitterToRatio(page, 85)
+  await expect.poll(() => paneRatio(page)).toBeCloseTo(85, 0)
+  await dragSplitterToRatio(page, 95)
+  await expect.poll(() => paneRatio(page)).toBeCloseTo(85, 0)
+  await expect.poll(() => page.evaluate(() => JSON.parse(sessionStorage.getItem('__vexa_session') ?? '{"tabs":[]}').tabs.length)).toBe(2)
+  const preferences = await page.evaluate(() => JSON.parse(sessionStorage.getItem('__vexa_session') ?? '{"tabs":[]}').tabs.map((tab: { requestWidthPercent: number }) => tab.requestWidthPercent))
+  expect(preferences).toEqual([15, 85])
+  const savesBeforeFastDrags = await page.evaluate(() => window.__VEXA_TEST__.invoked.filter((command) => command === 'save_session').length)
+  await dragSplitterToRatio(page, 42)
+  await dragSplitterToRatio(page, 58)
+  await dragSplitterToRatio(page, 85)
+  await expect.poll(() => page.evaluate(() => JSON.parse(sessionStorage.getItem('__vexa_session') ?? '{"tabs":[]}').tabs[1].requestWidthPercent)).toBe(85)
+  const fastDragSaveCount = await page.evaluate((baseline) => window.__VEXA_TEST__.invoked.filter((command) => command === 'save_session').length - baseline, savesBeforeFastDrags)
+  expect(fastDragSaveCount).toBeLessThanOrEqual(1)
+
+  await page.locator(`.tab[data-tab-id="${firstTabId}"]`).click()
+  await expect.poll(() => paneRatio(page)).toBeCloseTo(15, 0)
+  await page.locator('.tabs .tab').last().click()
+  await expect.poll(() => paneRatio(page)).toBeCloseTo(85, 0)
+
+  const originalPreferences = await page.evaluate(() => JSON.parse(sessionStorage.getItem('__vexa_session') ?? '{"tabs":[]}').tabs.map((tab: { requestWidthPercent: number }) => tab.requestWidthPercent))
+  await page.getByRole('button', { name: 'History' }).click()
+  await page.setViewportSize({ width: 900, height: 620 })
+  await expect.poll(() => paneRatio(page)).toBeCloseTo(85, 0)
+  const narrowMetrics = await page.evaluate(() => {
+    const workspace = document.querySelector<HTMLElement>('.workspace')!
+    const request = document.querySelector<HTMLElement>('.request-pane')!
+    const response = document.querySelector<HTMLElement>('.response-pane')!
+    const toolbar = document.querySelector<HTMLElement>('.top-controls')!
+    return { workspace: workspace.getBoundingClientRect().width, request: request.getBoundingClientRect().width, response: response.getBoundingClientRect().width, toolbarRight: toolbar.getBoundingClientRect().right, viewportWidth: innerWidth, documentWidth: document.documentElement.scrollWidth }
+  })
+  expect(narrowMetrics.request).toBeGreaterThan(0)
+  expect(narrowMetrics.response).toBeGreaterThan(0)
+  expect(narrowMetrics.request + narrowMetrics.response).toBeLessThanOrEqual(narrowMetrics.workspace)
+  expect(narrowMetrics.toolbarRight).toBeLessThanOrEqual(narrowMetrics.viewportWidth)
+  expect(narrowMetrics.documentWidth).toBeLessThanOrEqual(narrowMetrics.viewportWidth)
+  await page.setViewportSize({ width: 1280, height: 720 })
+  await page.getByRole('button', { name: '收合 History' }).click()
+  await expect.poll(() => paneRatio(page)).toBeCloseTo(85, 0)
+  expect(await page.evaluate(() => JSON.parse(sessionStorage.getItem('__vexa_session') ?? '{"tabs":[]}').tabs.map((tab: { requestWidthPercent: number }) => tab.requestWidthPercent))).toEqual(originalPreferences)
+
+  for (const [size, pixels] of [['small', 14], ['normal', 16], ['large', 18], ['xlarge', 20]] as const) {
+    await page.getByRole('button', { name: '字體大小設定' }).click()
+    await page.getByRole('button', { name: new RegExp(`^${size === 'small' ? 'Small' : size === 'normal' ? 'Normal' : size === 'large' ? 'Large' : 'XLarge'}`) }).click()
+    for (const ratio of [15, 85]) {
+      await dragSplitterToRatio(page, ratio)
+      await expect.poll(() => paneRatio(page)).toBeCloseTo(ratio, 0)
+      const metrics = await page.evaluate(() => {
+        const workspace = document.querySelector<HTMLElement>('.workspace')!
+        const request = document.querySelector<HTMLElement>('.request-pane')!
+        const response = document.querySelector<HTMLElement>('.response-pane')!
+        return { font: Number.parseFloat(getComputedStyle(document.querySelector('.app-shell')!).fontSize), workspace: workspace.getBoundingClientRect().width, request: request.getBoundingClientRect().width, response: response.getBoundingClientRect().width }
+      })
+      expect(metrics.font).toBe(pixels)
+      expect(metrics.request).toBeGreaterThan(0)
+      expect(metrics.response).toBeGreaterThan(0)
+      expect(metrics.request + metrics.response).toBeLessThanOrEqual(metrics.workspace)
+    }
+  }
+
+  await page.evaluate(() => {
+    const session = JSON.parse(sessionStorage.getItem('__vexa_session') ?? '{"tabs":[]}')
+    session.tabs[0].requestWidthPercent = 32
+    session.tabs[1].requestWidthPercent = 68
+    sessionStorage.setItem('__vexa_session_override', JSON.stringify(session))
+  })
+  await page.reload()
+  await expect(page.locator('.tabs .tab')).toHaveCount(2)
+  await expect.poll(() => paneRatio(page)).toBeCloseTo(68, 0)
+  await page.locator('.tabs .tab').first().click()
+  await expect.poll(() => paneRatio(page)).toBeCloseTo(32, 0)
+
+  await page.evaluate(() => {
+    const session = JSON.parse(sessionStorage.getItem('__vexa_session') ?? '{"tabs":[]}')
+    session.tabs[1].requestWidthPercent = 120
+    session.activeTabId = session.tabs[1].id
+    sessionStorage.setItem('__vexa_session_override', JSON.stringify(session))
+  })
+  await page.reload()
+  await expect(page.locator('.tabs .tab')).toHaveCount(2)
+  await expect.poll(() => paneRatio(page)).toBeCloseTo(50, 0)
+  await page.evaluate(() => {
+    const session = JSON.parse(sessionStorage.getItem('__vexa_session') ?? '{"tabs":[]}')
+    session.tabs[1].requestWidthPercent = 14.9
+    session.activeTabId = session.tabs[1].id
+    sessionStorage.setItem('__vexa_session_override', JSON.stringify(session))
+  })
+  await page.reload()
+  await expect(page.locator('.tabs .tab')).toHaveCount(2)
+  await expect.poll(() => paneRatio(page)).toBeCloseTo(50, 0)
+})
+
+async function paneRatio(page: Page) {
+  return page.locator('.workspace').evaluate((workspace) => {
+    const request = workspace.querySelector('.request-pane')!.getBoundingClientRect()
+    return request.width / (workspace.getBoundingClientRect().width - 8) * 100
+  })
+}
+
+async function dragSplitterToRatio(page: Page, ratio: number) {
+  const workspace = await page.locator('.workspace').boundingBox()
+  const splitter = await page.locator('.splitter').boundingBox()
+  expect(workspace).not.toBeNull()
+  expect(splitter).not.toBeNull()
+  const startX = splitter!.x + splitter!.width / 2
+  const y = splitter!.y + Math.min(30, splitter!.height / 2)
+  const endX = workspace!.x + ((workspace!.width - 8) * ratio / 100) + 4
+  await page.mouse.move(startX, y)
+  await page.mouse.down()
+  await page.mouse.move(endX, y, { steps: 5 })
+  await page.mouse.up()
+}
 
 test('History retention setting is saved as a portable preference', async ({ page }) => {
   await page.getByRole('button', { name: '字體大小設定' }).click()
