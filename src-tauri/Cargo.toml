@@ -1,6 +1,6 @@
 [package]
 name = "vexa"
-version = "0.2.1"
+version = "0.2.2"
 description = "A lightweight local HTTP client"
 authors = ["Vexa"]
 edition = "2021"

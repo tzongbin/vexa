@@ -2649,6 +2649,157 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual persistence performance profile; run with --ignored --nocapture"]
+    fn encrypted_store_performance_profile() {
+        let root = TempDirectory::new("store-performance-profile");
+        let request = persist_request(&request_snapshot(true)).unwrap();
+        let make_entry = |index: usize| HistoryEntry {
+            id: format!("performance-{index}"),
+            executed_at: "2026-10-24T01:02:03.000Z".into(),
+            request: request.clone(),
+        };
+
+        for count in [1_000, 5_000, 10_000] {
+            let history = HistoryFile {
+                version: JSON_STORE_VERSION,
+                entries: (0..count).map(make_entry).collect(),
+            };
+            let directory = root.0.join(format!("history-{count}"));
+            let path = directory.join(HISTORY_FILE_NAME);
+            let key = get_or_create_secret_key(&directory, None).unwrap();
+            let serialize_started = std::time::Instant::now();
+            let plaintext = serde_json::to_vec(&history).unwrap();
+            let serialize_elapsed = serialize_started.elapsed();
+            assert!(plaintext.len() < MAX_JSON_STORE_BYTES);
+
+            let encrypt_started = std::time::Instant::now();
+            let encrypted = encode_encrypted_json(&plaintext, &key, "history").unwrap();
+            let encrypt_elapsed = encrypt_started.elapsed();
+            let write_started = std::time::Instant::now();
+            write_bytes_atomically(&path, &encrypted, "history").unwrap();
+            let write_elapsed = write_started.elapsed();
+            let load_started = std::time::Instant::now();
+            let loaded = read_history_at(&path);
+            assert!(loaded.warning.is_none());
+            assert_eq!(loaded.value, history);
+            let load_elapsed = load_started.elapsed();
+
+            println!(
+                "History {count}: serialize={:.2}ms encrypt+envelope={:.2}ms atomic-write={:.2}ms load+decrypt+deserialize={:.2}ms plaintext={}B encrypted={}B",
+                serialize_elapsed.as_secs_f64() * 1_000.0,
+                encrypt_elapsed.as_secs_f64() * 1_000.0,
+                write_elapsed.as_secs_f64() * 1_000.0,
+                load_elapsed.as_secs_f64() * 1_000.0,
+                plaintext.len(),
+                encrypted.len(),
+            );
+        }
+
+        let session_request = request.clone();
+        let session = SessionFile {
+            version: JSON_STORE_VERSION,
+            tabs: (0..50)
+                .map(|index| SessionTab {
+                    id: format!("performance-tab-{index}"),
+                    history_id: None,
+                    record_history: true,
+                    request_width_percent: 50.0,
+                    request: session_request.clone(),
+                })
+                .collect(),
+            active_tab_id: "performance-tab-0".into(),
+        };
+        let session_directory = root.0.join("session");
+        let session_path = session_directory.join(SESSION_FILE_NAME);
+        let session_key = get_or_create_secret_key(&session_directory, None).unwrap();
+        let session_serialize_started = std::time::Instant::now();
+        let session_plaintext = serde_json::to_vec(&session).unwrap();
+        let session_serialize_elapsed = session_serialize_started.elapsed();
+        let session_encrypt_started = std::time::Instant::now();
+        let session_encrypted =
+            encode_encrypted_json(&session_plaintext, &session_key, "session").unwrap();
+        let session_encrypt_elapsed = session_encrypt_started.elapsed();
+        let session_write_started = std::time::Instant::now();
+        write_bytes_atomically(&session_path, &session_encrypted, "session").unwrap();
+        let session_write_elapsed = session_write_started.elapsed();
+        let session_load_started = std::time::Instant::now();
+        let session_loaded = read_session_at(&session_path);
+        let session_load_elapsed = session_load_started.elapsed();
+        assert_eq!(session_loaded.value, session);
+        assert!(session_loaded.warning.is_none());
+        let session_size = fs::metadata(&session_path).unwrap().len();
+        println!(
+            "Session 50 Tabs: serialize={:.2}ms encrypt+envelope={:.2}ms atomic-write={:.2}ms load+decrypt+deserialize={:.2}ms plaintext={}B encrypted={}B",
+            session_serialize_elapsed.as_secs_f64() * 1_000.0,
+            session_encrypt_elapsed.as_secs_f64() * 1_000.0,
+            session_write_elapsed.as_secs_f64() * 1_000.0,
+            session_load_elapsed.as_secs_f64() * 1_000.0,
+            session_plaintext.len(),
+            session_size,
+        );
+
+        let session_update_started = std::time::Instant::now();
+        for index in 0..20 {
+            let loaded = read_session_at(&session_path);
+            assert!(loaded.warning.is_none());
+            let mut updated = loaded.value;
+            updated.tabs[0].request.url = format!("https://example.test/api?edit={index}");
+            write_encrypted_atomically(&session_path, &updated, "session").unwrap();
+        }
+        let session_update_elapsed = session_update_started.elapsed();
+        assert!(read_session_at(&session_path).value.tabs[0]
+            .request
+            .url
+            .ends_with("edit=19"));
+        println!(
+            "Session 20 rapid snapshots at 50 Tabs: total={:.2}ms average={:.2}ms per full load+save",
+            session_update_elapsed.as_secs_f64() * 1_000.0,
+            session_update_elapsed.as_secs_f64() * 50.0,
+        );
+
+        let rapid_directory = root.0.join("rapid-history");
+        let rapid_path = rapid_directory.join(HISTORY_FILE_NAME);
+        let mut rapid_history = HistoryFile {
+            version: JSON_STORE_VERSION,
+            entries: (0..1_000).map(make_entry).collect(),
+        };
+        write_encrypted_atomically(&rapid_path, &rapid_history, "history").unwrap();
+        let started = std::time::Instant::now();
+        for index in 0..20 {
+            let loaded = read_history_at(&rapid_path);
+            assert!(loaded.warning.is_none());
+            rapid_history = loaded.value;
+            rapid_history.entries.insert(0, make_entry(10_000 + index));
+            prune_history(&mut rapid_history, 1_000);
+            write_encrypted_atomically(&rapid_path, &rapid_history, "history").unwrap();
+        }
+        let rapid_elapsed = started.elapsed();
+        assert_eq!(
+            read_history_at(&rapid_path).value.entries[0].id,
+            "performance-10019"
+        );
+        println!(
+            "History 20 rapid additions at 1,000 entries: total={:.2}ms average={:.2}ms per full load+save",
+            rapid_elapsed.as_secs_f64() * 1_000.0,
+            rapid_elapsed.as_secs_f64() * 50.0,
+        );
+
+        let boundary_directory = root.0.join("size-boundary");
+        let boundary_path = boundary_directory.join(HISTORY_FILE_NAME);
+        let original = HistoryFile {
+            version: JSON_STORE_VERSION,
+            entries: vec![make_entry(1)],
+        };
+        write_encrypted_atomically(&boundary_path, &original, "history").unwrap();
+        let original_bytes = fs::read(&boundary_path).unwrap();
+        let too_large = "x".repeat(MAX_JSON_STORE_BYTES + 1);
+        assert!(write_encrypted_atomically(&boundary_path, &too_large, "history").is_err());
+        assert_eq!(fs::read(&boundary_path).unwrap(), original_bytes);
+        assert_eq!(read_history_at(&boundary_path).value, original);
+        println!("32 MiB boundary: oversized write rejected and previous encrypted file preserved");
+    }
+
+    #[test]
     fn session_split_percent_defaults_old_and_invalid_values_and_rejects_invalid_writes() {
         let session = SessionFile {
             version: JSON_STORE_VERSION,
@@ -3244,13 +3395,6 @@ mod tests {
     }
 
     type MockHandler = Arc<dyn Fn(CapturedRequest) -> MockResponse + Send + Sync>;
-    static MOCK_SERVER_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn mock_server_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        MOCK_SERVER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 
     struct TempFileGuard(PathBuf);
 
@@ -3263,7 +3407,7 @@ mod tests {
     struct MockServer {
         address: SocketAddr,
         stopped: Arc<AtomicBool>,
-        accept_thread: Option<JoinHandle<()>>,
+        accept_thread: Option<JoinHandle<std::io::Result<()>>>,
         workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
     }
 
@@ -3271,40 +3415,49 @@ mod tests {
         fn new(handler: impl Fn(CapturedRequest) -> MockResponse + Send + Sync + 'static) -> Self {
             let listener =
                 TcpListener::bind(("127.0.0.1", 0)).expect("bind dynamic localhost port");
-            listener
-                .set_nonblocking(true)
-                .expect("set mock listener nonblocking");
+            // Bind synchronously before starting the accept thread. The bound listener stays
+            // alive for the fixture lifetime, so parallel fixtures cannot claim its port.
             let address = listener.local_addr().expect("read mock address");
             let stopped = Arc::new(AtomicBool::new(false));
             let workers = Arc::new(Mutex::new(Vec::new()));
             let server_stopped = stopped.clone();
             let server_workers = workers.clone();
             let handler: MockHandler = Arc::new(handler);
-            let accept_thread = thread::spawn(move || {
-                while !server_stopped.load(Ordering::Acquire) {
+            let accept_thread = thread::spawn(move || -> std::io::Result<()> {
+                loop {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            if server_stopped.load(Ordering::Acquire) {
+                                break;
+                            }
                             let handler = handler.clone();
                             let worker = thread::spawn(move || {
                                 if let Some(request) = read_request(&mut stream) {
                                     let response = handler(request);
                                     let _ = stream.write_all(&response.bytes);
                                     let _ = stream.flush();
-                                    if response.bytes.len() > 1024 * 1024 {
-                                        thread::sleep(Duration::from_millis(20));
-                                    }
                                 }
                             });
                             if let Ok(mut workers) = server_workers.lock() {
                                 workers.push(worker);
                             }
                         }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(2));
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::Interrupted
+                                    | std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::ConnectionReset
+                            ) =>
+                        {
+                            // Windows can report a reset pending connection from accept itself.
+                            // It belongs to that client, not to the listener lifetime.
+                            continue;
                         }
-                        Err(_) => break,
+                        Err(error) => return Err(error),
                     }
                 }
+                Ok(())
             });
             Self {
                 address,
@@ -3322,13 +3475,28 @@ mod tests {
     impl Drop for MockServer {
         fn drop(&mut self) {
             self.stopped.store(true, Ordering::Release);
-            let _ = TcpStream::connect(self.address);
+            let wake = TcpStream::connect_timeout(&self.address, Duration::from_secs(1))
+                .expect("wake the mock listener during teardown");
+            let _ = wake.shutdown(std::net::Shutdown::Both);
             if let Some(thread) = self.accept_thread.take() {
-                let _ = thread.join();
+                match thread.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) if !std::thread::panicking() => {
+                        panic!("mock HTTP server accept loop failed: {error}");
+                    }
+                    Err(payload) if !std::thread::panicking() => {
+                        std::panic::resume_unwind(payload);
+                    }
+                    _ => {}
+                }
             }
             if let Ok(mut workers) = self.workers.lock() {
                 for worker in workers.drain(..) {
-                    let _ = worker.join();
+                    if let Err(payload) = worker.join() {
+                        if !std::thread::panicking() {
+                            std::panic::resume_unwind(payload);
+                        }
+                    }
                 }
             }
         }
@@ -3508,7 +3676,6 @@ mod tests {
 
     #[test]
     fn mock_http_server_accepts_every_supported_method_and_preserves_query_and_headers() {
-        let _test_lock = mock_server_test_lock();
         let (sender, receiver) = mpsc::channel();
         let server = MockServer::new(move |request| {
             sender.send(request).expect("capture request");
@@ -3554,7 +3721,6 @@ mod tests {
 
     #[test]
     fn json_text_form_and_multipart_bodies_are_sent_from_user_input() {
-        let _test_lock = mock_server_test_lock();
         let (sender, receiver) = mpsc::channel();
         let server = MockServer::new(move |request| {
             sender.send(request).expect("capture request");
@@ -3678,7 +3844,6 @@ mod tests {
 
     #[test]
     fn basic_bearer_and_api_key_authorization_are_applied() {
-        let _test_lock = mock_server_test_lock();
         let (sender, receiver) = mpsc::channel();
         let server = MockServer::new(move |request| {
             sender.send(request).expect("capture request");
@@ -3733,7 +3898,6 @@ mod tests {
 
     #[test]
     fn status_codes_redirect_chains_loops_and_cookies_are_handled() {
-        let _test_lock = mock_server_test_lock();
         let server = MockServer::new(|request| match request.target.as_str() {
             "/redirect" => MockResponse::new(301, "").with_headers(&[("Location", "/second")]),
             "/second" => MockResponse::new(302, "").with_headers(&[("Location", "/final")]),
@@ -3786,7 +3950,6 @@ mod tests {
 
     #[test]
     fn redirects_do_not_forward_authorization_across_port() {
-        let _test_lock = mock_server_test_lock();
         let (sender, receiver) = mpsc::channel();
         let destination = MockServer::new(move |request| {
             sender.send(request).expect("capture redirected request");
@@ -3806,14 +3969,20 @@ mod tests {
 
     #[test]
     fn timeout_and_cancellation_end_the_http_operation() {
-        let _test_lock = mock_server_test_lock();
-        let server = MockServer::new(|_| {
+        let (started_sender, started_receiver) = mpsc::channel();
+        let server = MockServer::new(move |_| {
+            started_sender
+                .send(())
+                .expect("signal received request to test");
             thread::sleep(Duration::from_millis(300));
             MockResponse::new(200, "late")
         });
         let mut timeout_request = request(server.url("/delay/0.3"));
         timeout_request.timeout_ms = 40;
         assert_eq!(run_http(&timeout_request).unwrap_err().kind, "timeout");
+        started_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server should receive the timed out request");
 
         let cancel_request = request(server.url("/delay/0.3"));
         let cancellation = CancellationToken::new();
@@ -3821,14 +3990,15 @@ mod tests {
         let worker = thread::spawn(move || {
             tauri::async_runtime::block_on(execute_http(&cancel_request, task_token))
         });
-        thread::sleep(Duration::from_millis(40));
+        started_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server should receive the request before cancellation");
         cancellation.cancel();
         assert_eq!(worker.join().unwrap().unwrap_err().kind, "canceled");
     }
 
     #[test]
     fn response_limit_covers_below_equal_over_chunked_and_inaccurate_content_lengths() {
-        let _test_lock = mock_server_test_lock();
         let limit = MAX_RESPONSE_BYTES;
         let exact = vec![b'x'; limit];
         let chunked_body = vec![b'z'; limit + 1];

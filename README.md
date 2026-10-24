@@ -1,4 +1,4 @@
-# Vexa v0.2.1
+# Vexa v0.2.2
 
 Vexa 是一套輕量、純本機的桌面 HTTP/API Client。打開程式後即可輸入網址、設定 Request 並查看 Response；不需要帳號或雲端服務。
 
@@ -47,6 +47,7 @@ $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 
 ```powershell
 cargo fmt --manifest-path src-tauri\Cargo.toml --check
+cargo check --manifest-path src-tauri\Cargo.toml
 cargo test --manifest-path src-tauri\Cargo.toml
 cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings
 npm run build
@@ -56,7 +57,9 @@ npm run test:icons
 npm run test:tauri
 ```
 
-`npm run test:ui` 使用本機 Edge 和測試用 Mock IPC 驗證 Vue 互動與 Response Viewer；它不代表 Rust 或 Tauri IPC 已通過。`npm run test:tauri` 啟動 Release EXE、使用 WebView2 DevTools 連接實際視窗，並將請求送到測試期間動態配置的 localhost HTTP Server，也會在隔離暫存 Portable 副本驗證 JSON 資料。此測試需要 Windows WebView2 Runtime 與 DevTools 連線。Rust 單元測試使用隔離暫存目錄及動態 localhost Port；測試服務不會加入正式產品。
+`npm run test:ui` 使用本機 Edge 和測試用 Mock IPC 驗證 Vue 互動與 Response Viewer；它不代表 Rust 或 Tauri IPC 已通過。`npm run test:tauri` 啟動 Release EXE、使用 WebView2 DevTools 連接實際視窗，並將請求送到測試期間動態配置的 localhost HTTP Server，也會在隔離暫存 Portable 副本驗證 JSON 資料。此測試需要 Windows WebView2 Runtime 與 DevTools 連線。Rust 單元測試使用隔離暫存目錄及動態 localhost Port；Mock Listener 綁定後才啟動 accept loop，測試在預設平行模式執行且結束時會清理 Listener 與連線。
+
+可選擇以 `cargo test --manifest-path src-tauri\Cargo.toml --lib encrypted_store_performance_profile -- --ignored --nocapture` 在本機量測 1,000、5,000、10,000 筆 History、50 Tabs Session、連續新增及 32 MiB 邊界處理。此效能剖析使用暫存目錄與假資料，不屬於每次一般測試的時間門檻。
 
 正式 Windows 執行檔輸出於 `src-tauri\target\release\vexa.exe`。設定、History 或 Session 首次寫入時建立 EXE 同目錄的 `Data` 資料夾；預設值不會建立 JSON 檔。攜帶資料時請一併複製 EXE 與 `Data` 資料夾。開發模式依 Debug 執行檔位置，在 `src-tauri\target\debug\Data` 使用獨立資料。所有模式都不依賴目前工作目錄。JSON 寫入採暫存檔與原子替換；損壞檔案保留原樣並提示。若需要 NSIS 安裝包，執行 `npm run tauri build`，輸出位於 `src-tauri\target\release\bundle\nsis`。
 

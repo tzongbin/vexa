@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { execFile, spawn } from 'node:child_process'
 import { createServer } from 'node:http'
 import { once } from 'node:events'
+import { watch } from 'node:fs'
 import { cp, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, resolve } from 'node:path'
@@ -47,7 +48,7 @@ const appServer = createServer((request, response) => {
   request.on('data', (chunk) => chunks.push(chunk))
   request.on('end', () => {
     const body = Buffer.concat(chunks).toString('utf8')
-    receivedRequests.push({ method: request.method, authorization: request.headers.authorization, body })
+    receivedRequests.push({ method: request.method, url: request.url, authorization: request.headers.authorization, body })
     const status = Number(url.pathname.match(/^\/status\/(200|404|500)$/)?.[1] ?? 200)
     response.writeHead(status, {
       'content-type': 'application/json; charset=utf-8',
@@ -386,29 +387,110 @@ try {
   console.log('PASS 真正 Tauri IPC：取消/逾時後仍可重新 Send')
 
   const slowCountBefore = requestCounts.get('/delay') ?? 0
-  await page.getByLabel('Request URL').fill(`http://127.0.0.1:${appPort}/delay?ms=1200`)
+  await page.getByLabel('Timeout 毫秒').fill('15000')
+  await page.getByLabel('Request URL').fill(`http://127.0.0.1:${appPort}/delay?ms=10000&tab=A`)
   await page.getByRole('button', { name: /Send/ }).click()
-  const slowTab = tabByTitle(page, `GET 127.0.0.1:${appPort}/delay`)
+  const slowTabId = await page.locator('.tabs .tab-active').getAttribute('data-tab-id')
+  assert(slowTabId)
+  const slowTab = page.locator(`[data-tab-id="${slowTabId}"]`)
   await slowTab.locator('.tab-spinner').waitFor({ state: 'visible', timeout: 5_000 })
-  await page.keyboard.press('Control+Enter')
+
+  // Keep Tab A in flight while editing and sending independent Requests in other Tabs.
   await page.getByRole('button', { name: '新增 Tab' }).click()
-  await page.getByLabel('Request URL').fill(`http://127.0.0.1:${appPort}/json`)
+  await page.getByLabel('Request URL').fill(`http://127.0.0.1:${appPort}/json?tab=B`)
+  assert.equal(await page.getByLabel('Request URL').inputValue(), `http://127.0.0.1:${appPort}/json?tab=B`)
   await page.getByRole('button', { name: /Send/ }).click()
   await page.waitForFunction(() => document.querySelector('.status-pill')?.textContent?.includes('200 OK'))
   assert.match(await page.locator('.response-code').innerText(), /"method": "GET"/)
+  const quickRequest = receivedRequests.at(-1)
+  assert.equal(quickRequest.method, 'GET')
+  assert.match(quickRequest.url, /tab=B/)
+
   await page.getByRole('button', { name: '新增 Tab' }).click()
-  await page.getByLabel('Request URL').fill(`http://127.0.0.1:${appPort}/status/500`)
+  await page.locator('.method-select').selectOption('POST')
+  await page.getByRole('button', { name: 'Body', exact: true }).first().click()
+  await page.locator('.body-type').selectOption('json')
+  await page.getByLabel('Request Body 編輯器').fill('{"tab":"C","payload":"parallel"}')
+  await page.getByLabel('Request URL').fill(`http://127.0.0.1:${appPort}/json?tab=C`)
+  await page.getByRole('button', { name: /Send/ }).click()
+  await page.waitForFunction(() => document.querySelector('.status-pill')?.textContent?.includes('200 OK'))
+  const postRequest = receivedRequests.at(-1)
+  assert.equal(postRequest.method, 'POST')
+  assert.match(postRequest.url, /tab=C/)
+  assert.equal(postRequest.body, '{"tab":"C","payload":"parallel"}')
+  assert.match(await page.locator('.response-code').innerText(), /parallel/)
+
+  await page.getByRole('button', { name: '新增 Tab' }).click()
+  await page.getByLabel('Request URL').fill(`http://127.0.0.1:${appPort}/status/500?tab=D`)
   await page.getByRole('button', { name: /Send/ }).click()
   await page.waitForFunction(() => document.querySelector('.status-pill')?.textContent?.includes('500 Internal Server Error'))
-  await slowTab.locator('.tab-spinner').waitFor({ state: 'hidden', timeout: 5_000 })
-  assert.equal(requestCounts.get('/delay'), slowCountBefore + 1, 'Ctrl+Enter must not duplicate a running request')
+  assert.equal(requestCounts.get('/delay'), slowCountBefore + 1, 'the long-running request must be sent once')
+
+  await page.getByRole('button', { name: '新增 Tab' }).click()
+  await page.getByLabel('Timeout 毫秒').fill('15000')
+  await page.getByLabel('Request URL').fill(`http://127.0.0.1:${appPort}/delay?ms=10000&tab=E`)
+  const cancelTabId = await page.locator('.tabs .tab-active').getAttribute('data-tab-id')
+  assert(cancelTabId)
+  const canceledTab = page.locator(`[data-tab-id="${cancelTabId}"]`)
+  await page.getByRole('button', { name: /Send/ }).click()
+  await page.getByRole('button', { name: /取消/ }).waitFor({ state: 'visible', timeout: 5_000 })
+  await page.getByRole('button', { name: /取消/ }).click()
+  await page.waitForSelector('.error-canceled', { timeout: 5_000 })
+
+  await page.getByRole('button', { name: '新增 Tab' }).click()
+  await page.getByLabel('Timeout 毫秒').fill('100')
+  await page.getByLabel('Request URL').fill(`http://127.0.0.1:${appPort}/delay?ms=1500&tab=F`)
+  const timeoutTabId = await page.locator('.tabs .tab-active').getAttribute('data-tab-id')
+  assert(timeoutTabId)
+  const timeoutTab = page.locator(`[data-tab-id="${timeoutTabId}"]`)
+  await page.getByRole('button', { name: /Send/ }).click()
+  await page.waitForSelector('.error-timeout', { timeout: 5_000 })
+  await slowTab.locator('.tab-spinner').waitFor({ state: 'visible', timeout: 1_000 })
+
+  await slowTab.locator('.tab-spinner').waitFor({ state: 'hidden', timeout: 15_000 })
   await slowTab.click()
   assert.match(await page.locator('.response-code').innerText(), /finished after delay/)
   await tabByTitle(page, `GET 127.0.0.1:${appPort}/json`).last().click()
-  assert.match(await page.locator('.response-code').innerText(), /"method": "GET"/)
+  assert.match(await page.locator('.response-code').innerText(), /"tab",\s*"B"/)
+  await tabByTitle(page, `POST 127.0.0.1:${appPort}/json`).last().click()
+  assert.match(await page.locator('.response-code').innerText(), /parallel/)
   await tabByTitle(page, `GET 127.0.0.1:${appPort}/status/500`).last().click()
   assert.match(await page.locator('.status-pill').innerText(), /500 Internal Server Error/)
-  console.log('PASS 真正 Tauri IPC：三個 Tab 各自保存 Response，延遲完成不覆蓋其他 Tab，且不重複送出')
+  await canceledTab.click()
+  assert.equal(await page.locator('.error-canceled').count(), 1)
+  await timeoutTab.click()
+  assert.equal(await page.locator('.error-timeout').count(), 1)
+  console.log('PASS Release Tauri/WebView2 並行壓力：10 秒 GET、快速 GET、JSON POST、HTTP 500、Cancel、Timeout 各自維持 Response 歸屬')
+
+  await new Promise((resolveDelay) => setTimeout(resolveDelay, 750))
+  const sessionBeforeBurst = await readFile(sessionPath)
+  let sessionTargetEvents = 0
+  const sessionWatcher = watch(dirname(sessionPath), (_event, filename) => {
+    if (filename?.toString() === 'session.json') sessionTargetEvents += 1
+  })
+  try {
+    const burstStarted = Date.now()
+    await page.getByLabel('Request URL').evaluate((input, port) => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set
+      for (let index = 0; index < 30; index += 1) {
+        setter.call(input, `http://127.0.0.1:${port}/json?session-burst=${index}`)
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+      }
+    }, appPort)
+    assert.equal(await page.getByLabel('Request URL').inputValue(), `http://127.0.0.1:${appPort}/json?session-burst=29`)
+    const uiBurstElapsed = Date.now() - burstStarted
+    assert(uiBurstElapsed < 2_000, `UI should remain responsive during 30 rapid edits (observed ${uiBurstElapsed}ms)`)
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 850))
+    const sessionAfterBurst = await readFile(sessionPath)
+    assert(!sessionAfterBurst.equals(sessionBeforeBurst), 'the final rapid edit should be persisted')
+    assert(sessionTargetEvents <= 2, `600ms debounce should coalesce rapid edits; observed ${sessionTargetEvents} destination file events`)
+    console.log(`PASS Session 高頻率輸入：30 次同步編輯 ${uiBurstElapsed}ms 完成，Data/session.json file events=${sessionTargetEvents}`)
+  } finally {
+    sessionWatcher.close()
+  }
+
+  await slowTab.locator('.tab-title').click()
+  assert.match(await page.locator('.response-code').innerText(), /finished after delay/)
 
   await page.getByRole('button', { name: '新增 Tab' }).click()
   await page.getByLabel('Request URL').fill(`http://127.0.0.1:${appPort}/html`)
