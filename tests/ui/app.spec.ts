@@ -8,6 +8,7 @@ type TestBridge = {
   pending: Map<string, (result: unknown) => void>
   cancelCounts: Map<string, number>
   pwned: boolean
+  missingFiles: string[]
   savedSettings: Array<{ version: 1; appearance: { theme: 'system' | 'light' | 'dark'; fontSize: 'small' | 'normal' | 'large' | 'xlarge'; sourceFontSize: number | null } }>
 }
 
@@ -38,6 +39,7 @@ async function installTauriMock(page: Page) {
       pending: new Map(),
       cancelCounts: new Map(),
       pwned: false,
+      missingFiles: [],
       savedSettings: [],
     }
     const encode = (text: string) => {
@@ -83,6 +85,7 @@ async function installTauriMock(page: Page) {
           sessionStorage.setItem('__vexa_settings', JSON.stringify(settings))
           return undefined
         }
+        if (command === 'validate_multipart_files') return bridge.missingFiles
         if (command === 'load_history') {
           return { value: { version: 1, entries: JSON.parse(sessionStorage.getItem('__vexa_history') ?? '[]') }, warning: null }
         }
@@ -771,8 +774,17 @@ test('URL Enter and Ctrl+Enter send, body Enter and IME composition do not', asy
 
 test('History records repeated sends, opens a new unsent Tab, and clearing leaves Tabs open', async ({ page }) => {
   await page.getByLabel('Request URL').fill('http://mock/fast')
+  await page.getByRole('button', { name: 'Auth', exact: true }).click()
+  await page.locator('.request-pane').getByLabel('類型').selectOption('bearer')
+  await page.getByPlaceholder('Bearer token').fill('fixture-history-token')
+  await page.getByRole('button', { name: 'Body', exact: true }).first().click()
+  await page.locator('.body-type').selectOption('json')
+  await page.getByLabel('Request Body 編輯器').fill('{"fixture":"history-body"}')
   await page.getByRole('button', { name: /Send/ }).click()
   await expect(page.locator('.status-pill')).toContainText('200 OK')
+  const stored = await page.evaluate(() => JSON.parse(sessionStorage.getItem('__vexa_history') ?? '[]')[0].request)
+  expect(stored.auth.token).toBe('fixture-history-token')
+  expect(stored.body.text).toBe('{"fixture":"history-body"}')
   await page.getByRole('button', { name: /Send/ }).click()
   await expect.poll(() => page.evaluate(() => JSON.parse(sessionStorage.getItem('__vexa_history') ?? '[]').length)).toBe(2)
 
@@ -784,6 +796,10 @@ test('History records repeated sends, opens a new unsent Tab, and clearing leave
   await expect(page.locator('.tabs .tab')).toHaveCount(tabsBeforeOpen + 1)
   await expect(page.locator('.response-empty')).toBeVisible()
   expect(await page.evaluate(() => window.__VEXA_TEST__.sent.length)).toBe(sendsBeforeOpen)
+  await page.getByRole('button', { name: 'Auth', exact: true }).click()
+  await expect(page.getByPlaceholder('Bearer token')).toHaveValue('fixture-history-token')
+  await page.getByRole('button', { name: 'Body', exact: true }).first().click()
+  await expect(page.getByLabel('Request Body 編輯器')).toHaveValue('{"fixture":"history-body"}')
   await page.locator('.history-entry').first().click()
   await expect(page.locator('.tabs .tab')).toHaveCount(tabsBeforeOpen + 1)
 
@@ -816,4 +832,17 @@ test('History retention setting is saved as a portable preference', async ({ pag
   await page.getByRole('button', { name: '字體大小設定' }).click()
   await page.getByLabel('History 筆數上限').selectOption('5000')
   await expect.poll(() => page.evaluate(() => JSON.parse(sessionStorage.getItem('__vexa_settings') ?? '{}').historyLimit)).toBe(5000)
+})
+
+test('does not send a multipart request while a saved file path is missing', async ({ page }) => {
+  await page.getByRole('button', { name: 'Body', exact: true }).first().click()
+  await page.locator('.body-type').selectOption('multipart')
+  await page.getByLabel('Request URL').fill('http://mock/fast')
+  await page.evaluate(() => { window.__VEXA_TEST__.missingFiles = ['document：C:\\missing.pdf'] })
+  let alertMessage = ''
+  page.once('dialog', async (dialog) => { alertMessage = dialog.message(); await dialog.accept() })
+  await page.getByRole('button', { name: /Send/ }).click()
+  expect(alertMessage).toContain('原始檔案不存在')
+  expect(alertMessage).toContain('C:\\missing.pdf')
+  expect(await page.evaluate(() => window.__VEXA_TEST__.sent)).toHaveLength(0)
 })

@@ -13,6 +13,7 @@ const sourceExecutable = resolve('src-tauri/target/release/vexa.exe')
 let executable = sourceExecutable
 const execFileAsync = promisify(execFile)
 const requestCounts = new Map()
+const receivedRequests = []
 const appServer = createServer((request, response) => {
   const url = new URL(request.url ?? '/', 'http://localhost')
   requestCounts.set(url.pathname, (requestCounts.get(url.pathname) ?? 0) + 1)
@@ -45,6 +46,8 @@ const appServer = createServer((request, response) => {
   const chunks = []
   request.on('data', (chunk) => chunks.push(chunk))
   request.on('end', () => {
+    const body = Buffer.concat(chunks).toString('utf8')
+    receivedRequests.push({ method: request.method, authorization: request.headers.authorization, body })
     const status = url.pathname === '/status/500' ? 500 : 200
     response.writeHead(status, {
       'content-type': 'application/json; charset=utf-8',
@@ -54,7 +57,7 @@ const appServer = createServer((request, response) => {
       method: request.method,
       path: url.pathname,
       query: [...url.searchParams.entries()],
-      body: Buffer.concat(chunks).toString('utf8'),
+      body,
     }))
   })
 })
@@ -98,7 +101,17 @@ function launchApp() {
 
 async function connectAppPage() {
   await waitForDevTools(debuggerPort, child)
-  browser = await chromium.connectOverCDP(`http://127.0.0.1:${debuggerPort}`)
+  let connectionError
+  for (let attempt = 0; attempt < 50 && !browser; attempt += 1) {
+    try {
+      browser = await chromium.connectOverCDP(`http://127.0.0.1:${debuggerPort}`)
+    } catch (error) {
+      connectionError = error
+      if (child.exitCode !== null) throw error
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 200))
+    }
+  }
+  if (!browser) throw connectionError ?? new Error('WebView2 DevTools connection did not become ready.')
   const deadline = Date.now() + 10_000
   let page
   while (Date.now() < deadline && !page) {
@@ -184,6 +197,17 @@ async function waitForJsonFile(path, predicate) {
   throw new Error(`JSON file did not reach the expected state: ${path}`)
 }
 
+async function waitForChangedFile(path, previousBytes) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      const bytes = await readFile(path)
+      if (!bytes.equals(previousBytes)) return bytes
+    } catch { /* The current atomic replacement may not have completed yet. */ }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50))
+  }
+  throw new Error(`File was not updated after the explicit Session change: ${path}`)
+}
+
 try {
   appPort = await new Promise((resolveListen, rejectListen) => {
     appServer.once('error', rejectListen)
@@ -234,6 +258,7 @@ try {
   console.log('PASS 真正 Tauri IPC：Request 經 Rust HTTP Engine 送至動態 localhost Server，Response 回到原 Tab')
 
   await page.getByRole('button', { name: 'Auth', exact: true }).click()
+  await page.locator('.method-select').selectOption('POST')
   await page.locator('.request-pane').getByLabel('類型').selectOption('bearer')
   await page.getByPlaceholder('Bearer token').fill('vexa-smoke-token-never-persist')
   await page.getByRole('button', { name: 'Body', exact: true }).first().click()
@@ -244,14 +269,9 @@ try {
   await page.waitForFunction(() => document.querySelector('.status-pill')?.textContent?.includes('200 OK'))
   const historyPath = resolve(portableDirectory, 'Data/history.json')
   const sessionPath = resolve(portableDirectory, 'Data/session.json')
-  const savedHistory = await waitForJsonFile(historyPath, (history) => history.entries?.length > 0)
-  const latestRequest = savedHistory.entries[0].request
-  assert.equal(latestRequest.auth.token, '')
-  assert.equal(latestRequest.body.text, '')
-  assert.equal(latestRequest.needsSensitiveReview, true)
+  const savedHistory = await waitForJsonFile(historyPath, (history) => history.algorithm === 'AES-256-GCM' && typeof history.ciphertext === 'string')
   assert.equal(JSON.stringify(savedHistory).includes('vexa-smoke-token-never-persist'), false)
   assert.equal(JSON.stringify(savedHistory).includes('vexa-smoke-body-never-persist'), false)
-  assert.equal(savedHistory.entries.some((entry) => 'response' in entry || 'responseBody' in entry), false)
   await page.getByRole('button', { name: 'History' }).click()
   const beforeHistoryOpen = requestCounts.get('/json') ?? 0
   const tabCountBeforeHistory = await page.locator('.tabs .tab').count()
@@ -259,14 +279,23 @@ try {
   await page.waitForFunction(() => document.querySelector('.response-empty'))
   assert.equal(requestCounts.get('/json') ?? 0, beforeHistoryOpen, 'opening a History item must not send it')
   assert.equal(await page.locator('.tabs .tab').count(), tabCountBeforeHistory + 1)
-  await page.locator('.history-entry').first().click()
+  await page.getByRole('button', { name: 'Auth', exact: true }).click()
+  assert.equal(await page.getByPlaceholder('Bearer token').inputValue(), 'vexa-smoke-token-never-persist')
+  await page.getByRole('button', { name: 'Body', exact: true }).first().click()
+  assert.equal(await page.getByLabel('Request Body 編輯器').inputValue(), '{"privateKey":"vexa-smoke-body-never-persist"}')
+  await page.getByRole('button', { name: /Send/ }).click()
+  await page.waitForFunction(() => document.querySelector('.status-pill')?.textContent?.includes('200 OK'))
+  const replayedRequest = receivedRequests.at(-1)
+  assert.equal(replayedRequest.method, 'POST')
+  assert.equal(replayedRequest.authorization, 'Bearer vexa-smoke-token-never-persist')
+  assert.equal(replayedRequest.body, '{"privateKey":"vexa-smoke-body-never-persist"}')
+  await page.locator('.history-entry').nth(1).click()
   assert.equal(await page.locator('.tabs .tab').count(), tabCountBeforeHistory + 1, 'opening the same History item again selects its existing Tab')
   await page.locator('.tabs .tab').first().click()
-  const savedSession = await waitForJsonFile(sessionPath, (session) => session.tabs?.some((tab) => tab.request.url.endsWith('/json') && tab.request.auth.kind === 'bearer' && tab.request.needsSensitiveReview))
+  const savedSession = await waitForJsonFile(sessionPath, (session) => session.algorithm === 'AES-256-GCM' && typeof session.ciphertext === 'string')
   assert.equal(JSON.stringify(savedSession).includes('vexa-smoke-token-never-persist'), false)
   assert.equal(JSON.stringify(savedSession).includes('vexa-smoke-body-never-persist'), false)
-  assert.equal(savedSession.tabs.some((tab) => 'response' in tab), false)
-  console.log('PASS 真正 Tauri IPC：History 僅保存脫敏 Request、Body 預設排除、還原不送出且不保存 Response')
+  console.log('PASS 真正 Tauri IPC：完整 Request 加密保存、History 還原憑證與 Body 且不重新發送')
   await page.getByRole('button', { name: '新增 Tab' }).click()
 
   await page.getByLabel('Request URL').fill(`http://127.0.0.1:${appPort}/status/500`)
@@ -400,10 +429,17 @@ try {
   assert.deepEqual(persisted.appearance, { theme: 'system', fontSize: 'xlarge', sourceFontSize: 15 })
   const expectedActiveTabId = await page.locator('.tabs .tab-active').getAttribute('data-tab-id')
   const expectedTabCount = await page.locator('.tabs .tab').count()
-  const expectedSession = await waitForJsonFile(sessionPath, (session) => session.tabs?.length === expectedTabCount && session.activeTabId === expectedActiveTabId)
+  const previousSessionBytes = await readFile(sessionPath)
+  const otherTabId = await page.locator('.tabs .tab').evaluateAll((items, activeId) => items.find((item) => item.getAttribute('data-tab-id') !== activeId)?.getAttribute('data-tab-id'), expectedActiveTabId)
+  assert(otherTabId, 'the Session smoke test has another tab to switch through')
+  await page.locator(`.tabs .tab[data-tab-id="${otherTabId}"]`).click()
+  await page.locator(`.tabs .tab[data-tab-id="${expectedActiveTabId}"]`).click()
+  const expectedSessionBytes = await waitForChangedFile(sessionPath, previousSessionBytes)
+  const expectedSession = JSON.parse(expectedSessionBytes.toString('utf8'))
+  assert.equal(expectedSession.algorithm, 'AES-256-GCM')
   const expectedActiveUrl = await page.getByLabel('Request URL').inputValue()
   const persistedHistory = JSON.parse(await readFile(historyPath, 'utf8'))
-  assert.equal(persistedHistory.entries.every((entry) => !('response' in entry)), true)
+  assert.equal(persistedHistory.algorithm, 'AES-256-GCM')
   assert.equal(JSON.stringify(persistedHistory).includes('vexa-smoke-token-never-persist'), false)
   assert.equal(JSON.stringify(expectedSession).includes('vexa-smoke-body-never-persist'), false)
   await browser.close().catch(() => undefined)
@@ -415,6 +451,13 @@ try {
   assert.equal(await page.locator('.app-shell').getAttribute('data-theme'), 'system')
   await page.waitForFunction(({ count, id }) => document.querySelectorAll('.tabs .tab').length === count && document.querySelector('.tabs .tab-active')?.getAttribute('data-tab-id') === id, { count: expectedTabCount, id: expectedActiveTabId })
   assert.equal(await page.getByLabel('Request URL').inputValue(), expectedActiveUrl)
+  await page.locator('.response-empty').waitFor({ state: 'visible' })
+  const bearerTab = page.locator('.tabs .tab').filter({ hasText: 'POST /json' }).first()
+  await bearerTab.click()
+  await page.getByRole('button', { name: 'Auth', exact: true }).click()
+  assert.equal(await page.getByPlaceholder('Bearer token').inputValue(), 'vexa-smoke-token-never-persist')
+  await page.getByRole('button', { name: 'Body', exact: true }).first().click()
+  assert.equal(await page.getByLabel('Request Body 編輯器').inputValue(), '{"privateKey":"vexa-smoke-body-never-persist"}')
   await page.locator('.response-empty').waitFor({ state: 'visible' })
   const requestCountBeforeHistoryReload = [...requestCounts.values()].reduce((total, count) => total + count, 0)
   await page.getByRole('button', { name: 'History' }).click()
@@ -441,7 +484,24 @@ try {
   page = await connectAppPage()
   assert.equal(await page.locator('.app-shell').getAttribute('data-font-size'), 'xlarge')
   assert.equal(await page.locator('.app-shell').getAttribute('data-theme'), 'system')
-  console.log('PASS Portable 複製：EXE 與 Data/settings.json 複製後仍還原設定')
+  const copiedKey = await readFile(resolve(copiedPortableDirectory, 'Data/secret.key'))
+  assert.equal(copiedKey.subarray(0, 8).toString('ascii'), 'VEXAKEY1')
+  assert.equal(copiedKey.length, 40)
+  const copiedSessionTab = page.locator('.tabs .tab').filter({ hasText: 'POST /json' }).first()
+  await copiedSessionTab.click()
+  await page.getByRole('button', { name: 'Auth', exact: true }).click()
+  assert.equal(await page.getByPlaceholder('Bearer token').inputValue(), 'vexa-smoke-token-never-persist')
+  await page.getByRole('button', { name: 'Body', exact: true }).first().click()
+  assert.equal(await page.getByLabel('Request Body 編輯器').inputValue(), '{"privateKey":"vexa-smoke-body-never-persist"}')
+  await page.locator('.response-empty').waitFor({ state: 'visible' })
+  await page.getByRole('button', { name: 'History' }).click()
+  await page.locator('.history-method').selectOption('POST')
+  await page.locator('.history-entry').first().click()
+  await page.getByRole('button', { name: 'Auth', exact: true }).click()
+  assert.equal(await page.getByPlaceholder('Bearer token').inputValue(), 'vexa-smoke-token-never-persist')
+  await page.getByRole('button', { name: 'Body', exact: true }).first().click()
+  assert.equal(await page.getByLabel('Request Body 編輯器').inputValue(), '{"privateKey":"vexa-smoke-body-never-persist"}')
+  console.log('PASS Portable 複製：複製 EXE、Data 與 secret.key 後，Session/History 完整解密還原 Token/Body')
 
   await browser.close().catch(() => undefined)
   browser = undefined
@@ -485,6 +545,44 @@ try {
   await browser.close().catch(() => undefined)
   browser = undefined
   await stopApp()
+  const legacyDirectory = await createTemporaryDirectory('vexa-legacy-plain-data-')
+  executable = resolve(legacyDirectory, 'vexa.exe')
+  await copyFile(sourceExecutable, executable)
+  await mkdir(resolve(legacyDirectory, 'Data'))
+  const legacyRequest = {
+    method: 'POST', url: `http://127.0.0.1:${appPort}/json`, timeoutMs: 30000,
+    params: [], headers: [],
+    auth: { kind: 'bearer', username: '', password: '', token: '', key: '', value: '', location: 'header' },
+    body: { kind: 'json', text: '', fields: [] },
+    saveBodyContent: false, needsSensitiveReview: true, bodyContentSaved: false,
+  }
+  const legacyHistory = { version: 1, entries: [{ id: 'legacy-masked-entry', executedAt: '2026-10-24T01:02:03.000Z', request: legacyRequest }] }
+  const legacySession = { version: 1, tabs: [{ id: 'legacy-tab', historyId: 'legacy-masked-entry', recordHistory: true, request: legacyRequest }], activeTabId: 'legacy-tab' }
+  await writeFile(resolve(legacyDirectory, 'Data/history.json'), JSON.stringify(legacyHistory))
+  await writeFile(resolve(legacyDirectory, 'Data/session.json'), JSON.stringify(legacySession))
+  profileDirectory = await createTemporaryDirectory('vexa-tauri-webview2-legacy-')
+  debuggerPort = await getFreePort()
+  launchApp()
+  page = await connectAppPage()
+  await page.waitForFunction(() => document.querySelector('.tabs .tab')?.textContent?.includes('POST /json'))
+  const migratedHistory = JSON.parse(await readFile(resolve(legacyDirectory, 'Data/history.json'), 'utf8'))
+  const migratedSession = JSON.parse(await readFile(resolve(legacyDirectory, 'Data/session.json'), 'utf8'))
+  assert.equal(migratedHistory.algorithm, 'AES-256-GCM')
+  assert.equal(migratedSession.algorithm, 'AES-256-GCM')
+  assert.equal(JSON.stringify(migratedHistory).includes('"entries"'), false)
+  assert.equal(JSON.stringify(migratedSession).includes('"tabs"'), false)
+  await page.getByRole('button', { name: 'History' }).click()
+  const requestCountBeforeLegacyRestore = [...requestCounts.values()].reduce((sum, count) => sum + count, 0)
+  await page.locator('.history-entry').click()
+  await page.locator('.sensitive-review-note').waitFor({ state: 'visible' })
+  await page.getByRole('button', { name: 'Auth', exact: true }).click()
+  assert.equal(await page.getByPlaceholder('Bearer token').inputValue(), '')
+  assert.equal([...requestCounts.values()].reduce((sum, count) => sum + count, 0), requestCountBeforeLegacyRestore)
+  console.log('PASS v0.2.0 遷移：History/Session 明文驗證後加密，遮罩 Token 保持缺漏並提示檢查')
+
+  await browser.close().catch(() => undefined)
+  browser = undefined
+  await stopApp()
   const blockedDirectory = await createTemporaryDirectory('vexa-readonly-settings-')
   executable = resolve(blockedDirectory, 'vexa.exe')
   await copyFile(sourceExecutable, executable)
@@ -501,7 +599,13 @@ try {
   let permissionSettingsCreated = true
   try { await readFile(resolve(blockedDirectory, 'Data/settings.json')) } catch (error) { if (error?.code === 'ENOENT' || error?.code === 'EACCES') permissionSettingsCreated = false; else throw error }
   assert.equal(permissionSettingsCreated, false)
-  console.log('PASS 唯讀 Portable 目錄：UI 正常啟動與套用主題，並提示設定無法保存')
+  await page.getByLabel('Request URL').fill(`http://127.0.0.1:${appPort}/json`)
+  await page.getByRole('button', { name: /Send/ }).click()
+  await page.waitForFunction(() => document.querySelector('.status-pill')?.textContent?.includes('200 OK'))
+  let historyCouldNotBeCreated = false
+  try { await readFile(resolve(blockedDirectory, 'Data/history.json')); historyCouldNotBeCreated = true } catch (error) { if (error?.code !== 'ENOENT' && error?.code !== 'EACCES') throw error }
+  assert.equal(historyCouldNotBeCreated, false)
+  console.log('PASS 唯讀 Portable 目錄：Request 照常送出，偏好與 History 保存失敗有提示且不假報成功')
 } catch (error) {
   console.error('FAIL Tauri IPC smoke test')
   console.error(error)

@@ -89,7 +89,7 @@ export function createTab(): RequestTab {
     params: [], headers: [],
     auth: { kind: 'none', username: '', password: '', token: '', key: '', value: '', location: 'header' },
     body: { kind: 'none', text: '', fields: [] },
-    recordHistory: true, saveBodyContent: false, needsSensitiveReview: false, historyId: null,
+    recordHistory: true, saveBodyContent: true, needsSensitiveReview: false, historyId: null,
     requestState: 'idle', executionId: null, response: null, requestError: null, responseAt: null,
   }
 }

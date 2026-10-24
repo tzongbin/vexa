@@ -55,7 +55,7 @@ Vexa 是 **Local-first、輕量、跨平台的桌面 HTTP/API 測試工具**。�
 ### 3.4 History
 
 - 每次開始 Request 執行建立獨立記錄；相同 URL 不覆寫，且可在該 Request 停用記錄。
-- History 保存於 EXE 同目錄 `Data/history.json`，只保存執行時間與 Request 快照；不保存 Response Body、Headers、Status 或耗時。
+- History 保存於 EXE 同目錄 `Data/history.json`，以 AES-256-GCM 加密保存執行時間及完整 Request 快照；不保存 Response Body、Headers、Status 或耗時。
 - **預設最多 1,000 筆**，可選 100、500、1,000、5,000、10,000；超過上限立即淘汰最舊記錄。
 - History 支援 URL 搜尋、Method 篩選、日期分組、分批顯示，以及清除全部/今天/7 天以前/30 天以前。
 - 清除 History 不影響目前開啟的 Tabs。
@@ -66,15 +66,17 @@ Vexa 是 **Local-first、輕量、跨平台的桌面 HTTP/API 測試工具**。�
 
 - 使用 EXE 同目錄 `Data/session.json` 自動保存 Tab 順序、目前選取 Tab 與 Request 設定；採 Debounce，避免每個字元都寫檔。
 - 重啟時還原 Tabs 與 Request，所有 Response 皆為空白；關閉最後一個 Tab 時建立空白 Tab。
-- Session 與 History 使用版本欄位、格式驗證、原子替換與寫入序列化；損壞檔案保留原樣並提示，不得阻止啟動。
+- Session 與 History 使用 AES-256-GCM、版本欄位、格式驗證、原子替換與 Rust 端序列化寫入；損壞檔案保留原樣並提示，不得阻止啟動。
 
 ## 4. 資料儲存與敏感資訊
 
 - Portable JSON 是設定、History 與 Session 的儲存機制：`Data/settings.json`、`Data/history.json`、`Data/session.json`。正式路徑以 EXE 所在目錄為準。
 - Portable 資料目錄以程式所在目錄的 `Data` 為目標，但必須處理不可寫入、權限不足及多程序同時開啟等情況；不得默默遺失資料。
 - JSON 檔案須具版本、格式驗證、原子替換與序列化寫入；損壞時保留原始檔並提示，不可因此崩潰。
-- **不可把 Token、Password、API Key、Authorization、Cookie 當作普通明文無條件保存。** History/Session 遮罩常見秘密 Header、Query 參數與欄位；Auth 秘密值不保存，還原後提醒並要求使用者確認才可送出。
-- Body 預設不保存；使用者可逐 Request 明確允許保存。常見密碼類表單欄位仍遮罩，Multipart 檔案路徑永不保存。JSON/Text 任意內容無法可靠辨識所有秘密值，UI 必須說明此限制。
+- History/Session 以 RustCrypto AES-256-GCM 加密保存完整 Request，包含 Token、Password、API Key、Authorization、Cookie 與文字 Body；金鑰存於 EXE 同目錄 `Data/secret.key`，不得提供給 Vue。
+- Multipart 文字欄位與檔案路徑加密保存，檔案內容不嵌入 JSON；單筆完整 Request 保存上限 1 MiB，單一 JSON 檔上限 32 MiB。JSON/Text 任意內容無法可靠辨識所有秘密值，UI 必須說明內容會被加密保存。
+- v0.2.0 明文 History/Session 僅在完整解析、驗證、加密與解密比對後原子替換；遷移失敗保留原始資料。舊版已遮罩欄位不可還原，須保留缺漏狀態及送出確認提示。
+- 金鑰遺失、損壞或加密檔認證失敗時不得建立替代金鑰或覆寫資料；Portable 搬移必須一併複製 `Data/secret.key`。
 - 不向外部服務傳送使用者 Request、Response 或診斷資料，除非使用者明確要求送往其指定目標 API。
 
 ## 5. 架構與程式品質

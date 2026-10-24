@@ -2,12 +2,17 @@ use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
+use aes_gcm::{
+    aead::{Aead, KeyInit, Payload},
+    Aes256Gcm, Nonce,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use fs2::FileExt;
 use futures_util::StreamExt;
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE},
@@ -23,9 +28,16 @@ const MAX_UPLOAD_FILE_BYTES: u64 = 50 * 1024 * 1024;
 const SETTINGS_FILE_NAME: &str = "settings.json";
 const HISTORY_FILE_NAME: &str = "history.json";
 const SESSION_FILE_NAME: &str = "session.json";
+const SECRET_KEY_FILE_NAME: &str = "secret.key";
+const SECRET_KEY_MAGIC: &[u8; 8] = b"VEXAKEY1";
+const ENCRYPTION_ALGORITHM: &str = "AES-256-GCM";
+const ENCRYPTION_VERSION: u32 = 1;
+const NONCE_BYTES: usize = 12;
+const KEY_BYTES: usize = 32;
 const JSON_STORE_VERSION: u32 = 1;
 const MAX_HISTORY_ENTRIES: usize = 10_000;
 const MAX_JSON_STORE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PERSISTED_REQUEST_BYTES: usize = 1024 * 1024;
 const HISTORY_LIMITS: [usize; 5] = [100, 500, 1_000, 5_000, 10_000];
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -327,7 +339,7 @@ fn write_ui_settings_file(path: &PathBuf, settings: &UiSettings) -> Result<(), S
             .map_err(|error| format!("寫入設定失敗：{error}"))?;
         file.sync_all()
             .map_err(|error| format!("同步設定檔失敗：{error}"))?;
-        fs::rename(&temporary, path).map_err(|error| format!("更新設定檔失敗：{error}"))?;
+        atomic_replace(&temporary, path).map_err(|error| format!("更新設定檔失敗：{error}"))?;
         Ok(())
     })();
     if result.is_err() {
@@ -370,16 +382,17 @@ async fn save_ui_settings(
             .lock()
             .map_err(|_| "JSON 儲存狀態暫時無法使用。".to_owned())?;
         let path = settings_path()?;
+        let _file_lock = lock_data_store_for(&path)?;
         write_ui_settings_file(&path, &settings)?;
         let history_path = data_file_path(HISTORY_FILE_NAME)?;
         if history_path.exists() {
             let mut history = read_history_at(&history_path);
-            if history.warning.is_some() {
-                return Err("設定已保存，但 Data/history.json 格式錯誤，因此無法套用新的 History 上限；原始 History 已保留。".into());
+            if let Some(warning) = history.warning {
+                return Err(format!("設定已保存，但無法讀取 History，因此未套用新的上限；原始 History 已保留。{warning}"));
             }
             if history.value.entries.len() > settings.history_limit {
                 prune_history(&mut history.value, settings.history_limit);
-                write_json_atomically(&history_path, &history.value, "history")?;
+                write_encrypted_atomically(&history_path, &history.value, "history")?;
             }
         }
         Ok(())
@@ -467,6 +480,15 @@ struct SessionFile {
     active_tab_id: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct EncryptedJsonFile {
+    version: u32,
+    algorithm: String,
+    nonce: String,
+    ciphertext: String,
+}
+
 impl Default for SessionFile {
     fn default() -> Self {
         Self {
@@ -484,8 +506,30 @@ struct JsonFileLoad<T> {
     warning: Option<String>,
 }
 
+struct SecurePayload<T> {
+    value: Option<T>,
+    warning: Option<String>,
+}
+
 #[derive(Default)]
 struct JsonStoreWriteState(Arc<Mutex<()>>);
+
+fn lock_data_store_for(path: &Path) -> Result<std::fs::File, String> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| "Data 資料夾無效。".to_owned())?;
+    fs::create_dir_all(directory).map_err(|_| "無法建立 Data 資料夾。".to_owned())?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(directory.join(".vexa-store.lock"))
+        .map_err(|_| "無法鎖定 Portable Data 儲存區。".to_owned())?;
+    lock.lock_exclusive()
+        .map_err(|_| "無法鎖定 Portable Data 儲存區。".to_owned())?;
+    Ok(lock)
+}
 
 async fn run_store_task<T, F>(task: F) -> Result<T, String>
 where
@@ -555,271 +599,280 @@ fn valid_persisted_request(request: &PersistedRequest) -> bool {
     .is_ok()
 }
 
-fn is_sensitive_name(name: &str) -> bool {
-    let normalized: String = name
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect();
-    normalized == "key"
-        || [
-            "authorization",
-            "cookie",
-            "token",
-            "apikey",
-            "secret",
-            "password",
-            "passwd",
-            "accesskey",
-            "credential",
-        ]
-        .iter()
-        .any(|term| normalized.contains(term))
-}
-
-fn redact_url(raw: &str) -> (String, bool) {
-    let Ok(mut url) = Url::parse(raw) else {
-        return (raw.to_owned(), false);
-    };
-    let mut redacted = false;
-    if !url.username().is_empty() || url.password().is_some() {
-        let _ = url.set_username("");
-        let _ = url.set_password(None);
-        redacted = true;
-    }
-    let Some(_) = url.query() else {
-        return (if redacted { url.into() } else { raw.to_owned() }, redacted);
-    };
-    let pairs: Vec<(String, String, bool)> = url
-        .query_pairs()
-        .map(|(key, value)| {
-            let redact = is_sensitive_name(&key);
-            (
-                key.into_owned(),
-                if redact {
-                    String::new()
-                } else {
-                    value.into_owned()
-                },
-                redact,
-            )
-        })
-        .collect();
-    if !pairs.iter().any(|(_, _, redact)| *redact) {
-        return (if redacted { url.into() } else { raw.to_owned() }, redacted);
-    }
-    redacted = true;
-    url.set_query(None);
-    {
-        let mut query_pairs = url.query_pairs_mut();
-        for (key, value, _) in pairs {
-            query_pairs.append_pair(&key, &value);
-        }
-    }
-    (url.into(), redacted)
-}
-
-fn sanitize_request(input: &RequestSnapshotInput) -> Result<PersistedRequest, String> {
+fn persist_request(input: &RequestSnapshotInput) -> Result<PersistedRequest, String> {
     validate_request_input(input)?;
-    let (url, url_redacted) = redact_url(&input.url);
-    let mut needs_review = input.needs_sensitive_review || url_redacted;
-    let params = input
-        .params
-        .iter()
-        .cloned()
-        .map(|mut pair| {
-            if is_sensitive_name(&pair.key) && !pair.value.is_empty() {
-                pair.value.clear();
-                needs_review = true;
-            }
-            pair
-        })
-        .collect();
-    let headers = input
-        .headers
-        .iter()
-        .cloned()
-        .map(|mut header| {
-            if is_sensitive_name(&header.key) && !header.value.is_empty() {
-                header.value.clear();
-                needs_review = true;
-            }
-            header
-        })
-        .collect();
-    let mut auth = input.auth.clone();
-    if !auth.password.is_empty() || !auth.token.is_empty() || !auth.value.is_empty() {
-        needs_review = true;
-    }
-    auth.password.clear();
-    auth.token.clear();
-    auth.value.clear();
-    match auth.kind.as_str() {
-        "basic" => {
-            auth.key.clear();
-            auth.location = "header".into();
-        }
-        "bearer" => {
-            auth.username.clear();
-            auth.key.clear();
-            auth.location = "header".into();
-        }
-        "apiKey" => {
-            auth.username.clear();
-            auth.password.clear();
-            auth.token.clear();
-        }
-        _ => {
-            auth.username.clear();
-            auth.password.clear();
-            auth.token.clear();
-            auth.key.clear();
-            auth.value.clear();
-            auth.location = "header".into();
-        }
-    }
-    let mut body = input.body.clone();
-    let body_had_data = !body.text.is_empty()
-        || body
+    let body_content_saved = !input.body.text.is_empty()
+        || input
+            .body
             .fields
             .iter()
-            .any(|field| !field.value.is_empty() || !field.file_path.is_empty());
-    let body_content_saved = input.save_body_content && body_had_data;
-    if !input.save_body_content {
-        if body_had_data {
-            needs_review = true;
-        }
-        body.text.clear();
-        body.fields.clear();
-    } else {
-        for field in &mut body.fields {
-            if is_sensitive_name(&field.key) && !field.value.is_empty() {
-                field.value.clear();
-                needs_review = true;
-            }
-            if !field.file_path.is_empty() {
-                field.file_path.clear();
-                needs_review = true;
-            }
-        }
-    }
-    Ok(PersistedRequest {
+            .any(|field| !field.value.is_empty());
+    let request = PersistedRequest {
         method: input.method.clone(),
-        url,
+        url: input.url.clone(),
         timeout_ms: input.timeout_ms,
-        params,
-        headers,
-        auth,
-        body,
-        needs_sensitive_review: needs_review,
-        save_body_content: input.save_body_content,
+        params: input.params.clone(),
+        headers: input.headers.clone(),
+        auth: input.auth.clone(),
+        body: input.body.clone(),
+        needs_sensitive_review: input.needs_sensitive_review,
+        save_body_content: true,
         body_content_saved,
-    })
-}
-
-fn read_json_file<T: for<'de> Deserialize<'de>>(path: &PathBuf, label: &str) -> Result<T, String> {
-    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
-    if metadata.len() > MAX_JSON_STORE_BYTES as u64 {
-        return Err(format!("{label} 檔案超過 32 MiB 上限。"));
+    };
+    let size = serde_json::to_vec(&request)
+        .map_err(|error| format!("無法檢查 Request 保存大小：{error}"))?
+        .len();
+    if size > MAX_PERSISTED_REQUEST_BYTES {
+        return Err("單筆 Request 超過 1 MiB 保存上限；History/Session 未更新。".into());
     }
-    let bytes = fs::read(path).map_err(|error| error.to_string())?;
-    serde_json::from_slice(&bytes).map_err(|error| format!("JSON 格式錯誤：{error}"))
+    Ok(request)
 }
 
-fn read_history_at(path: &PathBuf) -> JsonFileLoad<HistoryFile> {
-    match read_json_file::<HistoryFile>(path, "History") {
-        Ok(history)
-            if history.version == JSON_STORE_VERSION
-                && history.entries.len() <= MAX_HISTORY_ENTRIES
-                && history.entries.iter().all(|entry| {
-                    !entry.id.is_empty()
-                        && entry.executed_at.len() == 24
-                        && valid_persisted_request(&entry.request)
-                }) =>
-        {
-            JsonFileLoad {
-                value: history,
-                warning: None,
-            }
-        }
-        Ok(_) => JsonFileLoad {
-            value: HistoryFile::default(),
-            warning: Some(
-                "History 版本或筆數不支援；已暫時使用空 History，原始檔案已保留。".into(),
-            ),
-        },
-        Err(_error) if !path.exists() => JsonFileLoad {
-            value: HistoryFile::default(),
-            warning: None,
-        },
-        Err(error) => JsonFileLoad {
-            value: HistoryFile::default(),
-            warning: Some(format!(
-                "無法讀取 Data/history.json；已暫時使用空 History，原始檔案已保留：{error}"
-            )),
-        },
-    }
+fn validate_history_file(history: &HistoryFile) -> bool {
+    history.version == JSON_STORE_VERSION
+        && history.entries.len() <= MAX_HISTORY_ENTRIES
+        && history.entries.iter().all(|entry| {
+            !entry.id.is_empty()
+                && entry.executed_at.len() == 24
+                && valid_persisted_request(&entry.request)
+        })
 }
 
-fn read_session_at(path: &PathBuf) -> JsonFileLoad<SessionFile> {
-    match read_json_file::<SessionFile>(path, "Session") {
-        Ok(session)
-            if session.version == JSON_STORE_VERSION
-                && !session.tabs.is_empty()
-                && session
-                    .tabs
-                    .iter()
-                    .all(|tab| !tab.id.is_empty() && valid_persisted_request(&tab.request))
-                && session
-                    .tabs
-                    .iter()
-                    .map(|tab| &tab.id)
-                    .collect::<std::collections::HashSet<_>>()
-                    .len()
-                    == session.tabs.len()
-                && session
-                    .tabs
-                    .iter()
-                    .any(|tab| tab.id == session.active_tab_id) =>
-        {
-            JsonFileLoad {
-                value: session,
-                warning: None,
-            }
-        }
-        Ok(_) => JsonFileLoad {
-            value: SessionFile::default(),
-            warning: Some(
-                "Session 版本或資料範圍不支援；已使用空白 Session，原始檔案已保留。".into(),
-            ),
-        },
-        Err(_error) if !path.exists() => JsonFileLoad {
-            value: SessionFile::default(),
-            warning: None,
-        },
-        Err(error) => JsonFileLoad {
-            value: SessionFile::default(),
-            warning: Some(format!(
-                "無法讀取 Data/session.json；已使用空白 Session，原始檔案已保留：{error}"
-            )),
-        },
-    }
+fn validate_session_file(session: &SessionFile) -> bool {
+    session.version == JSON_STORE_VERSION
+        && !session.tabs.is_empty()
+        && session
+            .tabs
+            .iter()
+            .all(|tab| !tab.id.is_empty() && valid_persisted_request(&tab.request))
+        && session
+            .tabs
+            .iter()
+            .map(|tab| &tab.id)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            == session.tabs.len()
+        && session
+            .tabs
+            .iter()
+            .any(|tab| tab.id == session.active_tab_id)
 }
 
-fn write_json_atomically<T: Serialize>(
-    path: &PathBuf,
-    value: &T,
-    label: &str,
-) -> Result<(), String> {
+fn encryption_aad(kind: &str) -> Vec<u8> {
+    format!("Vexa|{kind}|{ENCRYPTION_VERSION}|{ENCRYPTION_ALGORITHM}").into_bytes()
+}
+
+fn encode_encrypted_json(
+    plaintext: &[u8],
+    key: &[u8; KEY_BYTES],
+    kind: &str,
+) -> Result<Vec<u8>, String> {
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|_| "無法初始化 AES-256-GCM。".to_owned())?;
+    let mut nonce = [0_u8; NONCE_BYTES];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|_| "作業系統安全亂數產生失敗；資料未寫入。".to_owned())?;
+    let aad = encryption_aad(kind);
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| "無法加密 JSON 資料。".to_owned())?;
+    let envelope = EncryptedJsonFile {
+        version: ENCRYPTION_VERSION,
+        algorithm: ENCRYPTION_ALGORITHM.into(),
+        nonce: BASE64.encode(nonce),
+        ciphertext: BASE64.encode(ciphertext),
+    };
     let bytes =
-        serde_json::to_vec_pretty(value).map_err(|error| format!("無法編碼 {label}：{error}"))?;
+        serde_json::to_vec_pretty(&envelope).map_err(|_| "無法編碼加密 JSON 封裝。".to_owned())?;
+    if bytes.len() > MAX_JSON_STORE_BYTES {
+        return Err(format!("{kind} 超過 32 MiB 加密儲存上限。"));
+    }
+    Ok(bytes)
+}
+
+fn decode_encrypted_json(
+    bytes: &[u8],
+    key: &[u8; KEY_BYTES],
+    kind: &str,
+) -> Result<Vec<u8>, String> {
+    let envelope: EncryptedJsonFile = serde_json::from_slice(bytes)
+        .map_err(|_| format!("Data/{kind}.json 加密封裝格式錯誤；原始檔案已保留。"))?;
+    if envelope.version != ENCRYPTION_VERSION || envelope.algorithm != ENCRYPTION_ALGORITHM {
+        return Err(format!(
+            "Data/{kind}.json 加密版本或演算法不支援；原始檔案已保留。"
+        ));
+    }
+    let nonce = BASE64
+        .decode(envelope.nonce)
+        .map_err(|_| format!("Data/{kind}.json Nonce 格式錯誤；原始檔案已保留。"))?;
+    if nonce.len() != NONCE_BYTES {
+        return Err(format!("Data/{kind}.json Nonce 長度錯誤；原始檔案已保留。"));
+    }
+    let ciphertext = BASE64
+        .decode(envelope.ciphertext)
+        .map_err(|_| format!("Data/{kind}.json Ciphertext 格式錯誤；原始檔案已保留。"))?;
+    if ciphertext.len() < 16 {
+        return Err(format!(
+            "Data/{kind}.json Ciphertext 長度錯誤；原始檔案已保留。"
+        ));
+    }
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|_| "無法初始化 AES-256-GCM。".to_owned())?;
+    let aad = encryption_aad(kind);
+    cipher
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &ciphertext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| {
+            format!("Data/{kind}.json 認證解密失敗；金鑰錯誤或資料已損壞，原始檔案已保留。")
+        })
+}
+
+fn read_secret_key(path: &PathBuf) -> Result<[u8; KEY_BYTES], String> {
+    let bytes =
+        fs::read(path).map_err(|_| "Data/secret.key 無法讀取；加密資料未變更。".to_owned())?;
+    if bytes.len() != SECRET_KEY_MAGIC.len() + KEY_BYTES
+        || &bytes[..SECRET_KEY_MAGIC.len()] != SECRET_KEY_MAGIC
+    {
+        return Err("Data/secret.key 格式或長度錯誤；加密資料未變更。".into());
+    }
+    let mut key = [0_u8; KEY_BYTES];
+    key.copy_from_slice(&bytes[SECRET_KEY_MAGIC.len()..]);
+    Ok(key)
+}
+
+fn protected_file_is_known_legacy(path: &PathBuf) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(true);
+    }
+    let metadata = fs::metadata(path)
+        .map_err(|_| "無法檢查既有 History/Session；不建立新金鑰。".to_owned())?;
+    if metadata.len() > MAX_JSON_STORE_BYTES as u64 {
+        return Ok(false);
+    }
+    let bytes =
+        fs::read(path).map_err(|_| "無法讀取既有 History/Session；不建立新金鑰。".to_owned())?;
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            let raw = String::from_utf8_lossy(&bytes);
+            return Ok(!["\"algorithm\"", "\"ciphertext\"", "\"nonce\""]
+                .iter()
+                .any(|marker| raw.contains(marker)));
+        }
+    };
+    if value.get("algorithm").is_some()
+        || value.get("ciphertext").is_some()
+        || value.get("nonce").is_some()
+    {
+        return Ok(false);
+    }
+    // A v0.2.0 plaintext shape is distinguishable from the encrypted envelope.
+    // It is safe to initialize a key for a sibling legacy file even if that file
+    // later fails schema validation; it remains untouched and can be repaired.
+    let legacy_shape = value.get("version").and_then(serde_json::Value::as_u64)
+        == Some(JSON_STORE_VERSION as u64)
+        && (value.get("entries").is_some() || value.get("tabs").is_some());
+    Ok(legacy_shape)
+}
+
+fn get_or_create_secret_key(
+    data_dir: &PathBuf,
+    allowed_legacy: Option<&PathBuf>,
+) -> Result<[u8; KEY_BYTES], String> {
+    fs::create_dir_all(data_dir)
+        .map_err(|_| "無法建立 Data 資料夾；加密資料未寫入。".to_owned())?;
+    let key_path = data_dir.join(SECRET_KEY_FILE_NAME);
+    let lock_path = data_dir.join(".secret-key.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|_| "無法鎖定 Data/secret.key 初始化；資料未寫入。".to_owned())?;
+    lock.lock_exclusive()
+        .map_err(|_| "無法鎖定 Data/secret.key 初始化；資料未寫入。".to_owned())?;
+    if key_path.exists() {
+        return read_secret_key(&key_path);
+    }
+    for name in [HISTORY_FILE_NAME, SESSION_FILE_NAME] {
+        let protected = data_dir.join(name);
+        if allowed_legacy.is_some_and(|allowed| allowed == &protected) || !protected.exists() {
+            continue;
+        }
+        if !protected_file_is_known_legacy(&protected)? {
+            return Err("Data/secret.key 遺失或不存在，但已有加密或無法驗證的 History/Session；為避免失去解密能力，不建立新金鑰。".into());
+        }
+    }
+    let mut key = [0_u8; KEY_BYTES];
+    getrandom::getrandom(&mut key)
+        .map_err(|_| "作業系統安全亂數產生失敗；資料未寫入。".to_owned())?;
+    let mut contents = Vec::with_capacity(SECRET_KEY_MAGIC.len() + KEY_BYTES);
+    contents.extend_from_slice(SECRET_KEY_MAGIC);
+    contents.extend_from_slice(&key);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&key_path)
+        .map_err(|_| "無法安全建立 Data/secret.key；既有資料未變更。".to_owned())?;
+    if file
+        .write_all(&contents)
+        .and_then(|_| file.sync_all())
+        .is_err()
+    {
+        let _ = fs::remove_file(&key_path);
+        return Err("無法完整保存 Data/secret.key；既有資料未變更。".into());
+    }
+    Ok(key)
+}
+
+fn atomic_replace(temporary: &PathBuf, path: &PathBuf) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+        let source: Vec<u16> = OsStr::new(temporary).encode_wide().chain(Some(0)).collect();
+        let destination: Vec<u16> = OsStr::new(path).encode_wide().chain(Some(0)).collect();
+        let succeeded = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if succeeded == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(temporary, path)
+    }
+}
+
+fn write_bytes_atomically(path: &PathBuf, bytes: &[u8], label: &str) -> Result<(), String> {
     if bytes.len() > MAX_JSON_STORE_BYTES {
         return Err(format!("{label} 超過 32 MiB 儲存上限。"));
     }
     let directory = path
         .parent()
         .ok_or_else(|| format!("{label} 資料夾無效。"))?;
-    fs::create_dir_all(directory).map_err(|error| format!("無法建立 Data 資料夾：{error}"))?;
+    fs::create_dir_all(directory).map_err(|_| format!("無法建立 {label} 資料夾。"))?;
     static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let (temporary, mut file) = (0..16)
         .find_map(|_| {
@@ -837,20 +890,202 @@ fn write_json_atomically<T: Serialize>(
             }
         })
         .transpose()
-        .map_err(|error| format!("無法建立 {label} 暫存檔：{error}"))?
+        .map_err(|_| format!("無法建立 {label} 暫存檔。"))?
         .ok_or_else(|| format!("無法建立唯一的 {label} 暫存檔。"))?;
     let result = (|| {
-        file.write_all(&bytes)
-            .map_err(|error| format!("寫入 {label} 失敗：{error}"))?;
+        file.write_all(bytes)
+            .map_err(|_| format!("寫入 {label} 暫存檔失敗。"))?;
         file.sync_all()
-            .map_err(|error| format!("同步 {label} 失敗：{error}"))?;
-        fs::rename(&temporary, path).map_err(|error| format!("更新 {label} 失敗：{error}"))?;
+            .map_err(|_| format!("同步 {label} 暫存檔失敗。"))?;
+        atomic_replace(&temporary, path)
+            .map_err(|_| format!("原子替換 {label} 失敗；原始檔案仍保留。"))?;
         Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+fn write_encrypted_atomically<T: Serialize>(
+    path: &PathBuf,
+    value: &T,
+    kind: &str,
+) -> Result<(), String> {
+    let data_dir = path
+        .parent()
+        .ok_or_else(|| format!("{kind} 資料夾無效。"))?
+        .to_path_buf();
+    let key = get_or_create_secret_key(&data_dir, None)?;
+    let plaintext = serde_json::to_vec(value).map_err(|_| format!("無法編碼 {kind}。"))?;
+    if plaintext.len() > MAX_JSON_STORE_BYTES {
+        return Err(format!("{kind} 超過 32 MiB 儲存上限。"));
+    }
+    let bytes = encode_encrypted_json(&plaintext, &key, kind)?;
+    write_bytes_atomically(path, &bytes, kind)
+}
+
+fn cleanup_legacy_migration_artifacts(path: &Path, kind: &str) -> Result<(), String> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| format!("{kind} 資料夾無效。"))?;
+    let entries = fs::read_dir(directory)
+        .map_err(|_| format!("Data/{kind}.json 已加密，但無法檢查舊版明文暫存檔。"))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|_| format!("Data/{kind}.json 已加密，但無法檢查舊版明文暫存檔。"))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let fixed_backup = [
+            format!("{kind}.bak"),
+            format!("{kind}.old"),
+            format!("{kind}.json.bak"),
+            format!("{kind}.json.old"),
+        ]
+        .contains(&name);
+        let legacy_temp = name
+            .strip_prefix(&format!("{kind}."))
+            .and_then(|rest| rest.strip_suffix(".tmp"))
+            .is_some_and(|parts| {
+                let mut pieces = parts.split('.');
+                pieces
+                    .next()
+                    .is_some_and(|part| part.parse::<u32>().is_ok())
+                    && pieces
+                        .next()
+                        .is_some_and(|part| part.parse::<u64>().is_ok())
+                    && pieces.next().is_none()
+            });
+        if fixed_backup || legacy_temp {
+            let file_type = entry
+                .file_type()
+                .map_err(|_| format!("Data/{kind}.json 已加密，但無法檢查舊版明文暫存檔。"))?;
+            if file_type.is_file() || file_type.is_symlink() {
+                fs::remove_file(entry.path())
+                    .map_err(|_| format!("Data/{kind}.json 已加密，但舊版明文暫存檔無法清除。"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_secure_payload<T>(
+    path: &PathBuf,
+    kind: &str,
+    validate: fn(&T) -> bool,
+) -> Result<SecurePayload<T>, String>
+where
+    T: for<'de> Deserialize<'de> + Serialize + PartialEq,
+{
+    if !path.exists() {
+        return Ok(SecurePayload {
+            value: None,
+            warning: None,
+        });
+    }
+    let metadata =
+        fs::metadata(path).map_err(|_| format!("無法檢查 Data/{kind}.json；原始檔案已保留。"))?;
+    if metadata.len() > MAX_JSON_STORE_BYTES as u64 {
+        return Err(format!(
+            "Data/{kind}.json 超過 32 MiB 上限；原始檔案已保留。"
+        ));
+    }
+    let bytes =
+        fs::read(path).map_err(|_| format!("無法讀取 Data/{kind}.json；原始檔案已保留。"))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| format!("Data/{kind}.json 格式錯誤；原始檔案已保留。"))?;
+    let encrypted = value.get("algorithm").is_some()
+        || value.get("ciphertext").is_some()
+        || value.get("nonce").is_some();
+    if encrypted {
+        let data_dir = path
+            .parent()
+            .ok_or_else(|| format!("{kind} 資料夾無效。"))?;
+        let key_path = data_dir.join(SECRET_KEY_FILE_NAME);
+        if !key_path.exists() {
+            return Err(format!(
+                "Data/{kind}.json 已加密，但 Data/secret.key 遺失；檔案未覆蓋。"
+            ));
+        }
+        let key = read_secret_key(&key_path)?;
+        let plaintext = decode_encrypted_json(&bytes, &key, kind)?;
+        let loaded: T = serde_json::from_slice(&plaintext)
+            .map_err(|_| format!("Data/{kind}.json 解密後資料格式錯誤；原始檔案已保留。"))?;
+        if !validate(&loaded) {
+            return Err(format!(
+                "Data/{kind}.json 版本或資料欄位無效；原始檔案已保留。"
+            ));
+        }
+        let warning = cleanup_legacy_migration_artifacts(path, kind).err();
+        return Ok(SecurePayload {
+            value: Some(loaded),
+            warning,
+        });
+    }
+    let legacy: T = serde_json::from_slice(&bytes)
+        .map_err(|_| format!("Data/{kind}.json 舊版格式錯誤；原始檔案已保留。"))?;
+    if !validate(&legacy) {
+        return Err(format!(
+            "Data/{kind}.json 舊版版本或資料欄位無效；原始檔案已保留。"
+        ));
+    }
+    let data_dir = path
+        .parent()
+        .ok_or_else(|| format!("{kind} 資料夾無效。"))?
+        .to_path_buf();
+    let key = get_or_create_secret_key(&data_dir, Some(path))?;
+    let sealed = encode_encrypted_json(&bytes, &key, kind)?;
+    let round_trip = decode_encrypted_json(&sealed, &key, kind)?;
+    let verified: T = serde_json::from_slice(&round_trip)
+        .map_err(|_| format!("Data/{kind}.json 遷移驗證失敗；原始檔案保留。"))?;
+    if verified != legacy || !validate(&verified) {
+        return Err(format!("Data/{kind}.json 遷移內容驗證失敗；原始檔案保留。"));
+    }
+    write_bytes_atomically(path, &sealed, kind)?;
+    let warning = cleanup_legacy_migration_artifacts(path, kind).err();
+    Ok(SecurePayload {
+        value: Some(verified),
+        warning,
+    })
+}
+
+fn read_history_at(path: &PathBuf) -> JsonFileLoad<HistoryFile> {
+    match read_secure_payload(path, "history", validate_history_file) {
+        Ok(SecurePayload {
+            value: Some(value),
+            warning,
+        }) => JsonFileLoad { value, warning },
+        Ok(SecurePayload {
+            value: None,
+            warning,
+        }) => JsonFileLoad {
+            value: HistoryFile::default(),
+            warning,
+        },
+        Err(error) => JsonFileLoad {
+            value: HistoryFile::default(),
+            warning: Some(error),
+        },
+    }
+}
+
+fn read_session_at(path: &PathBuf) -> JsonFileLoad<SessionFile> {
+    match read_secure_payload(path, "session", validate_session_file) {
+        Ok(SecurePayload {
+            value: Some(value),
+            warning,
+        }) => JsonFileLoad { value, warning },
+        Ok(SecurePayload {
+            value: None,
+            warning,
+        }) => JsonFileLoad {
+            value: SessionFile::default(),
+            warning,
+        },
+        Err(error) => JsonFileLoad {
+            value: SessionFile::default(),
+            warning: Some(error),
+        },
+    }
 }
 
 fn prune_history(history: &mut HistoryFile, limit: usize) {
@@ -861,19 +1096,40 @@ fn prune_history(history: &mut HistoryFile, limit: usize) {
 }
 
 #[tauri::command]
-async fn load_history() -> JsonFileLoad<HistoryFile> {
-    run_store_task(|| match data_file_path(HISTORY_FILE_NAME) {
-        Ok(path) => read_history_at(&path),
-        Err(error) => JsonFileLoad {
-            value: HistoryFile::default(),
-            warning: Some(error),
-        },
+async fn load_history(
+    state: State<'_, JsonStoreWriteState>,
+) -> Result<JsonFileLoad<HistoryFile>, String> {
+    let store = Arc::clone(&state.0);
+    let result = run_store_task(move || {
+        let _guard = match store.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return JsonFileLoad {
+                    value: HistoryFile::default(),
+                    warning: Some("JSON 儲存狀態暫時無法使用。".into()),
+                }
+            }
+        };
+        match data_file_path(HISTORY_FILE_NAME) {
+            Ok(path) => match lock_data_store_for(&path) {
+                Ok(_file_lock) => read_history_at(&path),
+                Err(error) => JsonFileLoad {
+                    value: HistoryFile::default(),
+                    warning: Some(error),
+                },
+            },
+            Err(error) => JsonFileLoad {
+                value: HistoryFile::default(),
+                warning: Some(error),
+            },
+        }
     })
     .await
     .unwrap_or_else(|error| JsonFileLoad {
         value: HistoryFile::default(),
         warning: Some(error),
-    })
+    });
+    Ok(result)
 }
 
 #[tauri::command]
@@ -889,11 +1145,12 @@ async fn record_history(
         let settings_path = data_file_path(SETTINGS_FILE_NAME)?;
         let settings = read_ui_settings_at(&settings_path, None).settings;
         let path = data_file_path(HISTORY_FILE_NAME)?;
+        let _file_lock = lock_data_store_for(&path)?;
         let mut loaded = read_history_at(&path);
-        if loaded.warning.is_some() && path.exists() {
-            return Err("Data/history.json 格式錯誤，為保留原始檔案，本次 History 未寫入。".into());
+        if let Some(warning) = loaded.warning.as_deref().filter(|_| path.exists()) {
+            return Err(format!("History 未寫入，原始檔案已保留。{warning}"));
         }
-        let request = sanitize_request(&input)?;
+        let request = persist_request(&input)?;
         let id = format!(
             "{}-{}",
             std::process::id(),
@@ -911,7 +1168,7 @@ async fn record_history(
             },
         );
         prune_history(&mut loaded.value, settings.history_limit);
-        write_json_atomically(&path, &loaded.value, "history")
+        write_encrypted_atomically(&path, &loaded.value, "history")
     })
     .await?
 }
@@ -965,9 +1222,10 @@ async fn clear_history(
             .lock()
             .map_err(|_| "JSON 儲存狀態暫時無法使用。".to_owned())?;
         let path = data_file_path(HISTORY_FILE_NAME)?;
+        let _file_lock = lock_data_store_for(&path)?;
         let mut loaded = read_history_at(&path);
-        if loaded.warning.is_some() && path.exists() {
-            return Err("Data/history.json 格式錯誤，為保留原始檔案，本次沒有刪除。".into());
+        if let Some(warning) = loaded.warning.as_deref().filter(|_| path.exists()) {
+            return Err(format!("History 未清除，原始檔案已保留。{warning}"));
         }
         if scope == "all" {
             loaded.value.entries.clear();
@@ -1014,25 +1272,46 @@ async fn clear_history(
         } else {
             return Err("History 清除範圍無效。".into());
         }
-        write_json_atomically(&path, &loaded.value, "history")
+        write_encrypted_atomically(&path, &loaded.value, "history")
     })
     .await?
 }
 
 #[tauri::command]
-async fn load_session() -> JsonFileLoad<SessionFile> {
-    run_store_task(|| match data_file_path(SESSION_FILE_NAME) {
-        Ok(path) => read_session_at(&path),
-        Err(error) => JsonFileLoad {
-            value: SessionFile::default(),
-            warning: Some(error),
-        },
+async fn load_session(
+    state: State<'_, JsonStoreWriteState>,
+) -> Result<JsonFileLoad<SessionFile>, String> {
+    let store = Arc::clone(&state.0);
+    let result = run_store_task(move || {
+        let _guard = match store.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return JsonFileLoad {
+                    value: SessionFile::default(),
+                    warning: Some("JSON 儲存狀態暫時無法使用。".into()),
+                }
+            }
+        };
+        match data_file_path(SESSION_FILE_NAME) {
+            Ok(path) => match lock_data_store_for(&path) {
+                Ok(_file_lock) => read_session_at(&path),
+                Err(error) => JsonFileLoad {
+                    value: SessionFile::default(),
+                    warning: Some(error),
+                },
+            },
+            Err(error) => JsonFileLoad {
+                value: SessionFile::default(),
+                warning: Some(error),
+            },
+        }
     })
     .await
     .unwrap_or_else(|error| JsonFileLoad {
         value: SessionFile::default(),
         warning: Some(error),
-    })
+    });
+    Ok(result)
 }
 
 #[tauri::command]
@@ -1059,7 +1338,7 @@ async fn save_session(
                 id: tab.id,
                 history_id: tab.history_id,
                 record_history: tab.record_history,
-                request: sanitize_request(&tab.request)?,
+                request: persist_request(&tab.request)?,
             });
         }
         let active = if seen.contains(&active_tab_id) {
@@ -1073,10 +1352,13 @@ async fn save_session(
             active_tab_id: active,
         };
         let path = data_file_path(SESSION_FILE_NAME)?;
-        if path.exists() && read_session_at(&path).warning.is_some() {
-            return Err("Data/session.json 格式錯誤，為保留原始檔案，本次 Session 未寫入。".into());
+        let _file_lock = lock_data_store_for(&path)?;
+        if path.exists() {
+            if let Some(warning) = read_session_at(&path).warning {
+                return Err(format!("Session 未寫入，原始檔案已保留。{warning}"));
+            }
         }
-        write_json_atomically(&path, &session, "session")
+        write_encrypted_atomically(&path, &session, "session")
     })
     .await?
 }
@@ -1137,6 +1419,49 @@ struct BodyField {
     is_file: bool,
     file_path: String,
     content_type: String,
+}
+
+#[tauri::command]
+async fn validate_multipart_files(body: RequestBody) -> Result<Vec<String>, String> {
+    run_store_task(move || {
+        if body.kind != "multipart" {
+            return Vec::new();
+        }
+        body.fields
+            .iter()
+            .filter(|field| field.enabled && field.is_file)
+            .filter_map(|field| {
+                if field.file_path.is_empty() {
+                    return Some(format!(
+                        "{}：尚未選取檔案",
+                        if field.key.is_empty() {
+                            "檔案欄位"
+                        } else {
+                            &field.key
+                        }
+                    ));
+                }
+                let path = PathBuf::from(&field.file_path);
+                match fs::metadata(&path) {
+                    Ok(metadata)
+                        if metadata.is_file() && metadata.len() <= MAX_UPLOAD_FILE_BYTES =>
+                    {
+                        None
+                    }
+                    _ => Some(format!(
+                        "{}：{}",
+                        if field.key.is_empty() {
+                            "檔案欄位"
+                        } else {
+                            &field.key
+                        },
+                        field.file_path
+                    )),
+                }
+            })
+            .collect()
+    })
+    .await
 }
 
 #[derive(Debug, Serialize)]
@@ -1567,6 +1892,7 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
             send_request,
+            validate_multipart_files,
             cancel_request,
             save_response,
             load_ui_settings,
@@ -1762,49 +2088,20 @@ mod tests {
     }
 
     #[test]
-    fn history_and_session_sanitize_credentials_and_require_review() {
-        let default = sanitize_request(&request_snapshot(false)).unwrap();
-        assert!(default.needs_sensitive_review);
-        assert!(!default.body_content_saved);
-        assert!(default.body.text.is_empty());
-        assert_eq!(default.auth.username, "fixture-user");
-        assert!(default.auth.password.is_empty());
-        let url = Url::parse(&default.url).unwrap();
-        let query: Vec<(String, String)> = url
-            .query_pairs()
-            .map(|(key, value)| (key.into_owned(), value.into_owned()))
-            .collect();
-        assert!(query.contains(&("access_token".into(), String::new())));
-        assert!(query.contains(&("page".into(), "2".into())));
-        assert!(default.params[0].value.is_empty());
-        assert!(default.headers[0].value.is_empty());
-        assert_eq!(default.headers[1].value, "application/json");
-
-        let round_trip_input = RequestSnapshotInput {
-            method: default.method.clone(),
-            url: default.url.clone(),
-            timeout_ms: default.timeout_ms,
-            params: default.params.clone(),
-            headers: default.headers.clone(),
-            auth: default.auth.clone(),
-            body: default.body.clone(),
-            save_body_content: default.save_body_content,
-            needs_sensitive_review: default.needs_sensitive_review,
-        };
-        let round_trip = sanitize_request(&round_trip_input).unwrap();
-        assert!(
-            round_trip.needs_sensitive_review,
-            "a save after restart must retain the re-entry warning"
-        );
-
-        let opt_in = sanitize_request(&request_snapshot(true)).unwrap();
-        assert!(opt_in.body_content_saved);
-        // Arbitrary JSON/text values cannot be reliably identified as secrets.
-        assert_eq!(opt_in.body.text, r#"{"password":"body-secret"}"#);
+    fn history_and_session_retain_complete_request_values_for_encryption() {
+        let saved = persist_request(&request_snapshot(false)).unwrap();
+        assert!(!saved.needs_sensitive_review);
+        assert!(saved.body_content_saved);
+        assert_eq!(saved.body.text, r#"{"password":"body-secret"}"#);
+        assert_eq!(saved.auth.password, "basic-secret");
+        assert_eq!(saved.headers[0].value, "Bearer header-secret");
+        assert_eq!(saved.params[0].value, "query-secret");
+        assert!(saved.url.contains("access_token=url-secret"));
+        assert!(saved.save_body_content);
     }
 
     #[test]
-    fn opted_in_form_secrets_are_masked_and_upload_paths_are_never_saved() {
+    fn multipart_persists_text_fields_and_external_file_reference() {
         let mut input = request_snapshot(true);
         input.body.kind = "multipart".into();
         input.body.text.clear();
@@ -1826,28 +2123,52 @@ mod tests {
                 content_type: "application/pdf".into(),
             },
         ];
-        let sanitized = sanitize_request(&input).unwrap();
-        assert!(sanitized.body.fields[0].value.is_empty());
-        assert!(sanitized.body.fields[1].file_path.is_empty());
-        assert!(sanitized.needs_sensitive_review);
+        let saved = persist_request(&input).unwrap();
+        assert_eq!(saved.body.fields[0].value, "field-secret");
+        assert_eq!(saved.body.fields[1].file_path, "C:\\private\\document.pdf");
+        assert_eq!(saved.body.fields[1].content_type, "application/pdf");
+        assert!(!saved.needs_sensitive_review);
     }
 
     #[test]
-    fn history_and_session_json_round_trip_and_corruption_preserves_original() {
+    fn single_request_persistence_limit_is_enforced_without_truncating_request_content() {
+        let mut input = request_snapshot(true);
+        input.body.text = "x".repeat(MAX_PERSISTED_REQUEST_BYTES + 1);
+        let error = persist_request(&input).unwrap_err();
+        assert!(error.contains("1 MiB"));
+        assert_eq!(input.body.text.len(), MAX_PERSISTED_REQUEST_BYTES + 1);
+    }
+
+    #[test]
+    fn plaintext_history_and_session_migrate_and_round_trip_as_ciphertext() {
         let directory = TempDirectory::new("json-stores");
         let history_path = directory.0.join("Data").join(HISTORY_FILE_NAME);
         let session_path = directory.0.join("Data").join(SESSION_FILE_NAME);
-        let request = sanitize_request(&request_snapshot(false)).unwrap();
+        let request = persist_request(&request_snapshot(false)).unwrap();
         let mut history = HistoryFile::default();
         history.entries.push(HistoryEntry {
             id: "one".into(),
             executed_at: "2026-10-24T01:02:03.000Z".into(),
             request: request.clone(),
         });
-        write_json_atomically(&history_path, &history, "history").unwrap();
+        std::fs::create_dir_all(history_path.parent().unwrap()).unwrap();
+        std::fs::write(&history_path, serde_json::to_vec_pretty(&history).unwrap()).unwrap();
         assert_eq!(
             read_history_at(&history_path).value.entries,
             history.entries
+        );
+        let encrypted_history = std::fs::read(&history_path).unwrap();
+        assert!(String::from_utf8_lossy(&encrypted_history).contains("AES-256-GCM"));
+        assert!(!String::from_utf8_lossy(&encrypted_history).contains("basic-secret"));
+        assert!(!String::from_utf8_lossy(&encrypted_history).contains("body-secret"));
+        assert_eq!(
+            read_history_at(&history_path).value.entries,
+            history.entries
+        );
+        assert_eq!(
+            std::fs::read(&history_path).unwrap(),
+            encrypted_history,
+            "already encrypted payload is not migrated again"
         );
 
         let session = SessionFile {
@@ -1860,7 +2181,11 @@ mod tests {
             }],
             active_tab_id: "tab-one".into(),
         };
-        write_json_atomically(&session_path, &session, "session").unwrap();
+        std::fs::write(&session_path, serde_json::to_vec_pretty(&session).unwrap()).unwrap();
+        assert_eq!(read_session_at(&session_path).value.tabs, session.tabs);
+        let encrypted_session = std::fs::read(&session_path).unwrap();
+        assert!(!String::from_utf8_lossy(&encrypted_session).contains("basic-secret"));
+        assert!(!String::from_utf8_lossy(&encrypted_session).contains("body-secret"));
         assert_eq!(read_session_at(&session_path).value.tabs, session.tabs);
 
         std::fs::write(&history_path, b"{broken").unwrap();
@@ -1869,6 +2194,328 @@ mod tests {
         assert!(corrupt.warning.is_some());
         assert!(corrupt.value.entries.is_empty());
         assert_eq!(corrupt_bytes, std::fs::read(&history_path).unwrap());
+    }
+
+    #[test]
+    fn aes_gcm_uses_fresh_nonces_and_authenticates_payload_nonce_key_and_format() {
+        let key = [0x5a; KEY_BYTES];
+        let plaintext = br#"{"token":"fake-token","password":"fake-password"}"#;
+        let first = encode_encrypted_json(plaintext, &key, "history").unwrap();
+        let second = encode_encrypted_json(plaintext, &key, "history").unwrap();
+        let first_envelope: EncryptedJsonFile = serde_json::from_slice(&first).unwrap();
+        let second_envelope: EncryptedJsonFile = serde_json::from_slice(&second).unwrap();
+        assert_ne!(first_envelope.nonce, second_envelope.nonce);
+        assert_eq!(first_envelope.version, ENCRYPTION_VERSION);
+        assert_eq!(first_envelope.algorithm, ENCRYPTION_ALGORITHM);
+        assert!(!String::from_utf8_lossy(&first).contains("fake-token"));
+        assert!(!String::from_utf8_lossy(&first).contains("fake-password"));
+        assert_eq!(
+            decode_encrypted_json(&first, &key, "history").unwrap(),
+            plaintext
+        );
+        assert!(decode_encrypted_json(&first, &[0x33; KEY_BYTES], "history").is_err());
+        assert!(
+            decode_encrypted_json(&first, &key, "session").is_err(),
+            "store purpose is authenticated in AAD"
+        );
+
+        let mut payload_tampered = first_envelope.clone();
+        let mut ciphertext = BASE64.decode(&payload_tampered.ciphertext).unwrap();
+        ciphertext[0] ^= 1;
+        payload_tampered.ciphertext = BASE64.encode(ciphertext);
+        assert!(decode_encrypted_json(
+            &serde_json::to_vec(&payload_tampered).unwrap(),
+            &key,
+            "history"
+        )
+        .is_err());
+
+        let mut nonce_tampered = first_envelope.clone();
+        let mut nonce = BASE64.decode(&nonce_tampered.nonce).unwrap();
+        nonce[0] ^= 1;
+        nonce_tampered.nonce = BASE64.encode(nonce);
+        assert!(decode_encrypted_json(
+            &serde_json::to_vec(&nonce_tampered).unwrap(),
+            &key,
+            "history"
+        )
+        .is_err());
+
+        let mut bad_nonce_length = first_envelope.clone();
+        bad_nonce_length.nonce = BASE64.encode([0_u8; 11]);
+        assert!(decode_encrypted_json(
+            &serde_json::to_vec(&bad_nonce_length).unwrap(),
+            &key,
+            "history"
+        )
+        .unwrap_err()
+        .contains("Nonce 長度"));
+        let mut future_version = first_envelope;
+        future_version.version += 1;
+        assert!(decode_encrypted_json(
+            &serde_json::to_vec(&future_version).unwrap(),
+            &key,
+            "history"
+        )
+        .unwrap_err()
+        .contains("不支援"));
+    }
+
+    #[test]
+    fn key_loss_corruption_and_wrong_key_never_replace_encrypted_json() {
+        let directory = TempDirectory::new("key-failures");
+        let data = directory.0.join("Data");
+        let history_path = data.join(HISTORY_FILE_NAME);
+        let mut history = HistoryFile::default();
+        history.entries.push(HistoryEntry {
+            id: "retained".into(),
+            executed_at: "2026-10-24T01:02:03.000Z".into(),
+            request: persist_request(&request_snapshot(false)).unwrap(),
+        });
+        write_encrypted_atomically(&history_path, &history, "history").unwrap();
+        let encrypted = fs::read(&history_path).unwrap();
+        let key_path = data.join(SECRET_KEY_FILE_NAME);
+
+        fs::remove_file(&key_path).unwrap();
+        assert!(read_history_at(&history_path)
+            .warning
+            .unwrap()
+            .contains("secret.key 遺失"));
+        assert_eq!(fs::read(&history_path).unwrap(), encrypted);
+        assert!(
+            !key_path.exists(),
+            "a lost key is never silently regenerated"
+        );
+        let session = SessionFile {
+            version: JSON_STORE_VERSION,
+            tabs: vec![SessionTab {
+                id: "new-tab".into(),
+                history_id: None,
+                record_history: true,
+                request: history.entries[0].request.clone(),
+            }],
+            active_tab_id: "new-tab".into(),
+        };
+        assert!(
+            write_encrypted_atomically(&data.join(SESSION_FILE_NAME), &session, "session").is_err()
+        );
+        assert!(
+            !key_path.exists(),
+            "saving another store must not replace a lost key"
+        );
+        assert!(!data.join(SESSION_FILE_NAME).exists());
+
+        fs::write(&key_path, b"bad key").unwrap();
+        assert!(read_history_at(&history_path)
+            .warning
+            .unwrap()
+            .contains("格式或長度錯誤"));
+        assert_eq!(fs::read(&history_path).unwrap(), encrypted);
+
+        let mut wrong_key = Vec::from(SECRET_KEY_MAGIC.as_slice());
+        wrong_key.extend_from_slice(&[0x44; KEY_BYTES]);
+        fs::write(&key_path, wrong_key).unwrap();
+        assert!(read_history_at(&history_path)
+            .warning
+            .unwrap()
+            .contains("認證解密失敗"));
+        assert_eq!(fs::read(&history_path).unwrap(), encrypted);
+
+        let key = read_secret_key(&key_path).unwrap();
+        let mut envelope: EncryptedJsonFile = serde_json::from_slice(&encrypted).unwrap();
+        let mut ciphertext = BASE64.decode(&envelope.ciphertext).unwrap();
+        ciphertext[0] ^= 0x80;
+        envelope.ciphertext = BASE64.encode(ciphertext);
+        let tampered = serde_json::to_vec(&envelope).unwrap();
+        fs::write(&history_path, &tampered).unwrap();
+        assert!(read_history_at(&history_path)
+            .warning
+            .unwrap()
+            .contains("認證解密失敗"));
+        assert_eq!(fs::read(&history_path).unwrap(), tampered);
+        assert!(!encode_encrypted_json(b"x", &key, "history")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn encrypted_stores_are_portable_and_high_frequency_replacements_keep_latest_value() {
+        let directory = TempDirectory::new("portable-encrypted");
+        let source = directory.0.join("source").join("Data");
+        let history_path = source.join(HISTORY_FILE_NAME);
+        let mut history = HistoryFile::default();
+        history.entries.push(HistoryEntry {
+            id: "original".into(),
+            executed_at: "2026-10-24T01:02:03.000Z".into(),
+            request: persist_request(&request_snapshot(false)).unwrap(),
+        });
+        write_encrypted_atomically(&history_path, &history, "history").unwrap();
+        let session = SessionFile {
+            version: JSON_STORE_VERSION,
+            tabs: vec![SessionTab {
+                id: "tab-portable".into(),
+                history_id: None,
+                record_history: true,
+                request: history.entries[0].request.clone(),
+            }],
+            active_tab_id: "tab-portable".into(),
+        };
+        let source_session = source.join(SESSION_FILE_NAME);
+        write_encrypted_atomically(&source_session, &session, "session").unwrap();
+
+        let destination = directory.0.join("copied-app").join("Data");
+        fs::create_dir_all(&destination).unwrap();
+        for name in [HISTORY_FILE_NAME, SESSION_FILE_NAME, SECRET_KEY_FILE_NAME] {
+            fs::copy(source.join(name), destination.join(name)).unwrap();
+        }
+        assert_eq!(
+            read_history_at(&destination.join(HISTORY_FILE_NAME)).value,
+            history
+        );
+        assert_eq!(
+            read_session_at(&destination.join(SESSION_FILE_NAME)).value,
+            session
+        );
+
+        for index in 0..30 {
+            history.entries[0].id = format!("saved-{index}");
+            write_encrypted_atomically(&history_path, &history, "history").unwrap();
+        }
+        assert_eq!(
+            read_history_at(&history_path).value.entries[0].id,
+            "saved-29"
+        );
+    }
+
+    #[test]
+    fn legacy_masked_fields_are_preserved_as_missing_during_encryption_migration() {
+        let directory = TempDirectory::new("legacy-mask");
+        let path = directory.0.join("Data").join(HISTORY_FILE_NAME);
+        let mut old = persist_request(&request_snapshot(false)).unwrap();
+        old.auth.token.clear();
+        old.auth.password.clear();
+        old.params[0].value.clear();
+        old.headers[0].value.clear();
+        old.body.text.clear();
+        old.needs_sensitive_review = true;
+        old.body_content_saved = false;
+        let history = HistoryFile {
+            version: JSON_STORE_VERSION,
+            entries: vec![HistoryEntry {
+                id: "old-masked".into(),
+                executed_at: "2026-10-24T01:02:03.000Z".into(),
+                request: old.clone(),
+            }],
+        };
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, serde_json::to_vec(&history).unwrap()).unwrap();
+        let migrated = read_history_at(&path);
+        assert!(migrated.warning.is_none());
+        assert_eq!(migrated.value.entries[0].request, old);
+        assert!(migrated.value.entries[0].request.needs_sensitive_review);
+        assert!(migrated.value.entries[0].request.auth.password.is_empty());
+        assert!(migrated.value.entries[0].request.body.text.is_empty());
+    }
+
+    #[test]
+    fn partial_migration_is_retryable_and_does_not_rotate_the_existing_key() {
+        let directory = TempDirectory::new("partial-migration");
+        let data = directory.0.join("Data");
+        let history_path = data.join(HISTORY_FILE_NAME);
+        let session_path = data.join(SESSION_FILE_NAME);
+        let request = persist_request(&request_snapshot(false)).unwrap();
+        let history = HistoryFile {
+            version: JSON_STORE_VERSION,
+            entries: vec![HistoryEntry {
+                id: "migrated-first".into(),
+                executed_at: "2026-10-24T01:02:03.000Z".into(),
+                request: request.clone(),
+            }],
+        };
+        fs::create_dir_all(&data).unwrap();
+        fs::write(&history_path, serde_json::to_vec(&history).unwrap()).unwrap();
+        let history_temp = data.join("history.123.4.tmp");
+        let history_backup = data.join("history.json.bak");
+        fs::write(&history_temp, b"old plaintext token").unwrap();
+        fs::write(&history_backup, b"old plaintext body").unwrap();
+        let mut rejected_request = request.clone();
+        rejected_request.method = "TRACE".into();
+        let rejected_session = SessionFile {
+            version: JSON_STORE_VERSION,
+            tabs: vec![SessionTab {
+                id: "too-large-tab".into(),
+                history_id: None,
+                record_history: true,
+                request: rejected_request,
+            }],
+            active_tab_id: "too-large-tab".into(),
+        };
+        let rejected_bytes = serde_json::to_vec(&rejected_session).unwrap();
+        fs::write(&session_path, &rejected_bytes).unwrap();
+        let session_temp = data.join("session.123.4.tmp");
+        fs::write(&session_temp, b"old plaintext token").unwrap();
+
+        assert_eq!(read_history_at(&history_path).value, history);
+        assert!(!history_temp.exists());
+        assert!(!history_backup.exists());
+        let key_before = fs::read(data.join(SECRET_KEY_FILE_NAME)).unwrap();
+        let encrypted_history = fs::read(&history_path).unwrap();
+        assert!(read_session_at(&session_path).warning.is_some());
+        assert_eq!(fs::read(&session_path).unwrap(), rejected_bytes);
+        assert!(
+            session_temp.exists(),
+            "failed migration preserves related plaintext artifacts"
+        );
+
+        let session = SessionFile {
+            version: JSON_STORE_VERSION,
+            tabs: vec![SessionTab {
+                id: "retry-tab".into(),
+                history_id: None,
+                record_history: false,
+                request,
+            }],
+            active_tab_id: "retry-tab".into(),
+        };
+        fs::write(&session_path, serde_json::to_vec(&session).unwrap()).unwrap();
+        assert_eq!(read_session_at(&session_path).value, session);
+        assert!(!session_temp.exists());
+        assert_eq!(
+            fs::read(data.join(SECRET_KEY_FILE_NAME)).unwrap(),
+            key_before
+        );
+        assert_eq!(fs::read(&history_path).unwrap(), encrypted_history);
+    }
+
+    #[test]
+    fn secret_key_initialization_is_serialized_across_threads() {
+        let directory = TempDirectory::new("key-race");
+        let data = directory.0.join("Data");
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let data = data.clone();
+                thread::spawn(move || get_or_create_secret_key(&data, None).unwrap())
+            })
+            .collect();
+        let keys: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert!(keys.iter().all(|key| key == &keys[0]));
+        assert_eq!(fs::read(data.join(SECRET_KEY_FILE_NAME)).unwrap().len(), 40);
+    }
+
+    #[test]
+    fn atomic_replace_failure_keeps_existing_destination_bytes() {
+        let directory = TempDirectory::new("atomic-replace-failure");
+        let destination = directory.0.join("destination.json");
+        // A directory cannot be atomically replaced by a file, so this exercises the
+        // platform replace error path without risking the existing destination.
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("keep"), b"keep").unwrap();
+        assert!(write_bytes_atomically(&destination, b"replacement bytes", "test").is_err());
+        assert_eq!(fs::read(destination.join("keep")).unwrap(), b"keep");
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
     }
 
     #[test]
@@ -1884,7 +2531,7 @@ mod tests {
             history.entries.push(HistoryEntry {
                 id: id.into(),
                 executed_at: executed_at.into(),
-                request: sanitize_request(&request_snapshot(false)).unwrap(),
+                request: persist_request(&request_snapshot(false)).unwrap(),
             });
         }
         prune_history(&mut history, 1);

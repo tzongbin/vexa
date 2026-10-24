@@ -1,4 +1,4 @@
-# Vexa v0.2.0
+# Vexa v0.2.1
 
 Vexa 是一套輕量、純本機的桌面 HTTP/API Client。打開程式後即可輸入網址、設定 Request 並查看 Response；不需要帳號或雲端服務。
 
@@ -74,11 +74,19 @@ npm run test:tauri
 }
 ```
 
-`history.json` 使用 `{ "version": 1, "entries": [...] }`，每筆包含唯一 ID、UTC 執行時間與 Request 快照，不包含 Response。`session.json` 使用 `{ "version": 1, "tabs": [...], "activeTabId": "..." }`。History 與 Session 由 Rust 驗證及讀寫，JSON 檔案上限為 32 MiB。
+`settings.json` 保持一般 JSON 格式，僅保存 UI 偏好與 History 上限。`history.json` 與 `session.json` 保留 `.json` 副檔名，但檔案內容是 AES-256-GCM 加密封裝，不含明文 Request。封裝包含版本、演算法、每次加密新產生的 96-bit Nonce，以及 Base64 Ciphertext（包含認證標籤）；檔案種類、版本和演算法由 AAD 認證。Rust 使用 RustCrypto `aes-gcm` 0.10.3 執行加解密，Vue 不會取得金鑰。
+
+第一次加密保存時，Rust 透過作業系統安全亂數產生 256-bit 金鑰，保存於 `Data/secret.key`。此檔案以 `VEXAKEY1` 標記開頭，後接 32 bytes 原始金鑰；既有金鑰會檢查格式與長度，損壞時不會重建。金鑰初始化及 Data 儲存由 Rust 鎖定，History / Session 使用暫存密文與原子替換；Data 內可能另有 `.vexa-store.lock`、`.secret-key.lock` 兩個不含 Request 或金鑰的隱藏協調檔。History 與 Session JSON 上限各為 32 MiB，單筆完整 Request 上限為 1 MiB；超過時該次保存會回報錯誤，原有檔案不會被覆寫。設定、History、Session 均以執行檔實際所在目錄下的 `Data` 為準，不依賴目前工作目錄。
+
+攜帶或複製 Vexa 時，請一起複製執行檔與整個 `Data` 目錄，包含 `secret.key`。不要只搬 History / Session，也不要將 `Data` 提交至 Git。若金鑰遺失、損壞或被另一把金鑰取代，加密資料將無法解密；Vexa 會保留原檔、不產生替代金鑰，也會停止覆寫受影響的資料。整個 `Data` 目錄若遭複製或外洩，攻擊者同時取得密文與金鑰，仍可讀取內容；此機制主要避免 JSON 檔直接暴露 Request，不等同於作業系統帳戶隔離或硬碟加密。金鑰不使用 Windows DPAPI / Registry，因此攜帶 `Data` 才可跨目錄搬移。
+
+首次讀取 v0.2.0 明文 `history.json` / `session.json` 時，Rust 會先完整解析與驗證，再加密、解密驗證資料相等，最後才原子替換原檔。History 和 Session 分開遷移，可在下次啟動重試未完成的檔案；成功遷移會清除該資料檔對應的 v0.2.0 `.tmp`、`.bak`、`.old` 殘留檔，遷移失敗則保留原始檔案及相關殘留檔並提示。遷移不保證 SSD 或檔案系統曾用區塊的安全抹除。v0.2.0 已遮罩或省略的 Auth、Header、Query、Body 值無法恢復；原缺漏狀態與重新檢查提示會保留，新版才完整保存加密後的 Request。
+
+History 預設完整保存實際 Request，包括 Token、API Key、Cookie、Header、Query、Auth 與文字 Body；點選 History 還原至新 Tab，不會自動送出，Session 重啟後還原 Request 但不還原 Response。Multipart 的文字欄位與檔案路徑會加密保存，檔案內容不會嵌入 JSON；送出前會檢查檔案是否仍存在。檔案路徑指向 Portable `Data` 以外的檔案，複製程式後不保證仍有效。JSON/Text Body 可包含無法自動識別的秘密內容，允許保存時會一併加密持久化。
 
 Windows 應用使用 WebView2；Tauri 設定會在安裝包流程加入 Evergreen Bootstrapper。單獨複製 EXE 到其他電腦時，目標電腦仍須具備 WebView2 Runtime。Node.js 與 Rust 不屬於執行時需求。
 
-## v0.2.0 功能
+## v0.2.1 功能
 
 - Compact Layout：Tab Bar 與 Request / Response 標題列依全域字級縮放保持精簡；新增 Tab 按鈕固定跟隨最後一個 Tab，多 Tab 時可水平捲動。
 - Request / Response 左右分割、拖曳調整比例、深色/淺色/跟隨系統主題；藍色互動主題及 2xx/3xx/4xx/5xx 語意色彩。主題、字級及 Source 個別字級自動保存於 Portable JSON 設定檔。
@@ -88,10 +96,11 @@ Windows 應用使用 WebView2；Tauri 設定會在安裝包流程加入 Evergree
 - 多 Tabs；各 Tab 獨立保存 Request、Response 與執行狀態，關閉執行中 Tab 會取消 Request。
 - Tab Bar 水平捲動；溢出時顯示左右按鈕，支援 Shift+滾輪與觸控板原生水平捲動；新增或切換 Tab 自動捲至可見位置，右側工具列固定。
 - Send 按鈕只顯示圖示與 Send；URL Enter 與 Ctrl+Enter 發送，Body Enter 保留換行，IME 組字不會誤送。
-- JSON History 與 Session：每次執行保存獨立 Request 快照，不保存 Response；預設上限 1,000，可選 100/500/1,000/5,000/10,000，超限淘汰最舊資料。
+- AES-256-GCM 加密 History 與 Session：完整保存 Request 與文字 Body，保留執行快照、History 筆數上限與清除功能；Response 不持久化。v0.2.0 明文資料首次讀取時安全遷移，`secret.key` 隨 Portable `Data` 搬移。
+- History 預設上限 1,000，可選 100/500/1,000/5,000/10,000，超限淘汰最舊資料。每筆加密保存的 Request 上限 1 MiB；每個 JSON 資料檔上限 32 MiB。
 - History 可搜尋 URL、篩選 Method、依日期分組、分批顯示及清除全部/今天/7 天以前/30 天以前。點選記錄會開新 Tab，不會重新送出；已開啟的記錄會切換至既有 Tab。
 - Session 以 Debounce 保存 Tabs、順序、作用中的 Tab 與 Request；重新啟動後還原 Request，但所有 Response 保持空白。
-- Auth 秘密值與常見 Authorization/API Key/Cookie Header、秘密 Query/欄位會遮罩。Body 預設不保存；每個 Request 可明確允許保存 Body。JSON/Text 無法自動辨識所有秘密值；Multipart 檔案路徑永不保存。資料被省略時，還原後會要求檢查並確認才可送出。
+- History / Session 的 Request 與 Body 以 AES-256-GCM 加密保存。舊版已遮罩欄位仍需重新輸入並在送出前確認；Multipart 檔案路徑加密保存但不攜帶檔案內容。
 - GET、POST、PUT、PATCH、DELETE、HEAD、OPTIONS。
 - URL Query、重複 Key/Headers、欄位啟用/停用。
 - None、Basic、Bearer、API Key Header / Query Authorization。
@@ -107,7 +116,8 @@ Windows 應用使用 WebView2；Tauri 設定會在安裝包流程加入 Evergree
 - 文字編碼目前以 UTF-8 解碼；未依 Response charset 自動轉碼。PDF、影音及未知 Binary 僅提供另存。
 - HTML 預覽使用無權限的 sandbox iframe，阻擋 Script 與網路資源；不可用來驗證需要 JavaScript 或外部資源的頁面。
 - 檔案上傳採明確選取的檔案路徑；單檔上限 50 MiB，檔案會載入記憶體後送出。
-- JSON/Text Body 的任意內容無法自動判斷所有秘密值；若允許保存 Body，該內容可能留在 History/Session。每個 JSON 資料檔有 32 MiB 上限；磁碟唯讀或資料損壞時會提示並保留損壞原檔。
+- 單筆 Request 超過 1 MiB 時不會寫入 History/Session，單一資料檔上限 32 MiB；儲存失敗會提示並保留先前檔案。唯讀目錄、遺失金鑰、無效金鑰或損壞資料不會導致程式停止發送 Request，也不會被當成空資料覆寫。
+- `secret.key` 遺失時無法復原資料；請妥善備份整個 `Data` 目錄。若整個目錄外洩，金鑰也包含其中。加密不會保證 SSD 或檔案系統層級的安全抹除。
 - Windows Server 2016、Linux、macOS 相容性未驗證；安裝包及其他 Windows 版本需另外驗證。
 
 ## 不包含

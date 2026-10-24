@@ -216,7 +216,7 @@ function snapshotRequest(tab: RequestTab) {
   return {
     method: tab.method, url: tab.url, timeoutMs: tab.timeoutMs,
     params: tab.params, headers: tab.headers, auth: tab.auth, body: tab.body,
-    saveBodyContent: tab.saveBodyContent, needsSensitiveReview: tab.needsSensitiveReview,
+    saveBodyContent: true, needsSensitiveReview: tab.needsSensitiveReview,
   }
 }
 function cloneData<T>(value: T): T {
@@ -238,15 +238,25 @@ function scheduleSessionSave() {
   if (!sessionLoaded.value || sessionPersistenceBlocked) return
   window.clearTimeout(sessionSaveTimer)
   sessionSaveTimer = window.setTimeout(() => {
-    const sessionTabs: SessionEntry[] = tabs.value.map((tab) => ({
-      id: tab.id, historyId: tab.historyId, recordHistory: tab.recordHistory,
-      request: snapshotRequest(tab) as StoredRequest,
-    }))
-    const selected = activeId.value
-    sessionSaveQueue = sessionSaveQueue.catch(() => undefined)
-      .then(() => invoke<void>('save_session', { tabs: sessionTabs, activeTabId: selected }))
-      .catch((error: unknown) => message(`無法保存 Data/session.json：${String(error)}`))
+    queueSessionSave(true)
   }, 600)
+}
+
+function queueSessionSave(showError: boolean) {
+  const sessionTabs: SessionEntry[] = tabs.value.map((tab) => ({
+    id: tab.id, historyId: tab.historyId, recordHistory: tab.recordHistory,
+    request: snapshotRequest(tab) as StoredRequest,
+  }))
+  const selected = activeId.value
+  sessionSaveQueue = sessionSaveQueue.catch(() => undefined)
+    .then(() => invoke<void>('save_session', { tabs: sessionTabs, activeTabId: selected }))
+    .catch((error: unknown) => { if (showError) message(`無法保存 Data/session.json：${String(error)}`) })
+}
+
+function flushSessionSave() {
+  if (!sessionLoaded.value || sessionPersistenceBlocked) return
+  window.clearTimeout(sessionSaveTimer)
+  queueSessionSave(false)
 }
 
 async function loadSession() {
@@ -329,6 +339,16 @@ function handleUrlEnter(event: KeyboardEvent) {
 async function sendRequest() {
   const tab = activeTab.value
   if (isBusy(tab)) return
+  try {
+    const missingFiles = await invoke<string[]>('validate_multipart_files', { body: tab.body })
+    if (missingFiles.length) {
+      window.alert(`Multipart 原始檔案不存在或超過 50 MiB，請重新選取或移除欄位後再送出：\n\n${missingFiles.join('\n')}`)
+      return
+    }
+  } catch (error) {
+    message(`無法檢查 Multipart 檔案；Request 未送出：${String(error)}`)
+    return
+  }
   if (tab.needsSensitiveReview) {
     if (!window.confirm('此 Request 曾因安全規則省略或遮罩機密欄位，認證或 Body 可能需要重新輸入。請先檢查 Request。仍要直接送出目前內容嗎？')) return
     tab.needsSensitiveReview = false
@@ -616,6 +636,7 @@ onMounted(() => {
     if (tabsNav.value.parentElement) historyObserver.observe(tabsNav.value.parentElement)
   }
   window.addEventListener('resize', updateTabScrollState)
+  window.addEventListener('beforeunload', flushSessionSave)
   void nextTick(updateTabScrollState)
   void loadUiSettings()
   void loadHistory()
@@ -626,6 +647,8 @@ onBeforeUnmount(() => {
   window.removeEventListener('wheel', handleGlobalWheel, true)
   window.removeEventListener('pointerdown', closeSettingsOnOutsidePointer, true)
   window.removeEventListener('resize', updateTabScrollState)
+  window.removeEventListener('beforeunload', flushSessionSave)
+  flushSessionSave()
   historyObserver?.disconnect()
   window.clearTimeout(noticeTimer)
   window.clearTimeout(sessionSaveTimer)
@@ -720,8 +743,7 @@ onBeforeUnmount(() => {
             <div class="section-copy body-section-copy"><div><h2>Request Body</h2><p v-if="activeTab.body.kind === 'multipart'">Multipart 會自動產生必要的 boundary，Content-Type 由 HTTP Engine 設定。</p><p v-else>依照內容類型自動設定 Content-Type，可用自訂 Header 覆寫。</p></div>
               <select v-model="activeTab.body.kind" class="control-select body-type"><option value="none">None</option><option value="json">JSON</option><option value="text">Text</option><option value="form">Form URL Encoded</option><option value="multipart">Multipart Form Data</option></select>
             </div>
-            <label class="body-save-option"><input v-model="activeTab.saveBodyContent" type="checkbox" />允許將 Body 內容保存至 History / Session</label>
-            <p class="body-save-warning">Body 可能含有無法自動辨識的秘密值；預設不保存。常見密碼欄位會遮罩，Multipart 檔案路徑永不保存。</p>
+            <p class="body-save-warning">History 與 Session 會使用 AES-256-GCM 加密保存完整 Request，每筆新保存內容上限 1 MiB。Multipart 檔案內容不會複製，僅保存原始檔案路徑；搬移 Data 目錄後請確認檔案仍存在。</p>
             <CodeEditor v-if="activeTab.body.kind === 'json' || activeTab.body.kind === 'text'" v-model="activeTab.body.text" :language="activeTab.body.kind === 'json' ? 'json' : 'text'" :placeholder="activeTab.body.kind === 'json' ? '{\n  \n}' : '輸入 Request Body…'" />
             <KeyValueEditor v-else-if="activeTab.body.kind === 'form'" v-model="activeTab.body.fields" key-label="Key" value-label="Value" empty-text="尚無表單欄位" />
             <div v-else-if="activeTab.body.kind === 'multipart'" class="multipart-list">
@@ -782,7 +804,7 @@ onBeforeUnmount(() => {
       </section>
     </section>
     </div>
-    <footer class="statusbar"><span class="statusbar-left"><span class="statusbar-led"></span>Vexa v0.2.0 <span class="status-divider">·</span> HTTP requests run locally</span><span class="statusbar-right">{{ activeTab.method }} <span class="status-divider">·</span> {{ tabs.length }} {{ tabs.length === 1 ? 'Tab' : 'Tabs' }} <span class="shortcut-hint">Ctrl T 新增　Ctrl W 關閉　Esc 取消</span></span></footer>
+    <footer class="statusbar"><span class="statusbar-left"><span class="statusbar-led"></span>Vexa v0.2.1 <span class="status-divider">·</span> HTTP requests run locally</span><span class="statusbar-right">{{ activeTab.method }} <span class="status-divider">·</span> {{ tabs.length }} {{ tabs.length === 1 ? 'Tab' : 'Tabs' }} <span class="shortcut-hint">Ctrl T 新增　Ctrl W 關閉　Esc 取消</span></span></footer>
     <Transition name="toast"><div v-if="notice" class="toast-message">{{ notice }}</div></Transition>
   </main>
 </template>

@@ -1,6 +1,6 @@
 [package]
 name = "vexa"
-version = "0.2.0"
+version = "0.2.1"
 description = "A lightweight local HTTP client"
 authors = ["Vexa"]
 edition = "2021"
@@ -14,6 +14,9 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 base64 = "0.22"
+aes-gcm = "0.10.3"
+fs2 = "0.4.3"
+getrandom = "0.2.17"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "charset", "gzip", "brotli", "deflate", "zstd", "multipart", "stream"] }
 serde = { version = "1", features = ["derive"] }
@@ -24,3 +27,6 @@ tauri-plugin-dialog = "2"
 tokio = { version = "1", features = ["fs", "macros", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 url = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
