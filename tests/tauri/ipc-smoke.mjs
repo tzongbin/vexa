@@ -48,7 +48,7 @@ const appServer = createServer((request, response) => {
   request.on('end', () => {
     const body = Buffer.concat(chunks).toString('utf8')
     receivedRequests.push({ method: request.method, authorization: request.headers.authorization, body })
-    const status = url.pathname === '/status/500' ? 500 : 200
+    const status = Number(url.pathname.match(/^\/status\/(200|404|500)$/)?.[1] ?? 200)
     response.writeHead(status, {
       'content-type': 'application/json; charset=utf-8',
       'set-cookie': ['fixture=one; HttpOnly', 'fixture2=two; Secure'],
@@ -135,6 +135,10 @@ async function ctrlWheel(page, selector, deltaY) {
   } finally {
     await session.detach()
   }
+}
+
+function tabByTitle(page, title) {
+  return page.locator('.tabs .tab').filter({ hasText: title })
 }
 
 async function stopApp() {
@@ -252,10 +256,21 @@ try {
   await page.getByRole('button', { name: /Send/ }).click()
   await page.waitForFunction(() => document.querySelector('.status-pill')?.textContent?.includes('200 OK'))
   assert.equal(await page.getByLabel('Request URL').inputValue(), `http://127.0.0.1:${appPort}/json?name=%E6%B8%AC%E8%A9%A6`)
+  assert.equal(await page.locator('.tab-active .tab-title').innerText(), `GET 127.0.0.1:${appPort}/json`)
   const jsonBody = await page.locator('.response-code').innerText()
   assert.match(jsonBody, /測試/)
   assert.match(jsonBody, /"method": "GET"/)
   console.log('PASS 真正 Tauri IPC：Request 經 Rust HTTP Engine 送至動態 localhost Server，Response 回到原 Tab')
+
+  for (const status of [200, 404, 500]) {
+    await page.getByLabel('Request URL').fill(`http://127.0.0.1:${appPort}/status/${status}`)
+    const expectedTitle = `GET 127.0.0.1:${appPort}/status/${status}`
+    assert.equal(await page.locator('.tab-active .tab-title').innerText(), expectedTitle)
+    await page.getByRole('button', { name: /Send/ }).click()
+    await page.waitForFunction((value) => document.querySelector('.status-pill')?.textContent?.includes(`${value} `), status)
+    assert.equal(await page.locator('.tab-active .tab-title').innerText(), expectedTitle)
+  }
+  console.log('PASS 真正 Tauri/WebView2 IPC：HTTP 200、404、500 完成後 Tab 標題維持一致')
 
   await page.getByRole('button', { name: 'Auth', exact: true }).click()
   await page.locator('.method-select').selectOption('POST')
@@ -328,7 +343,7 @@ try {
   const slowCountBefore = requestCounts.get('/delay') ?? 0
   await page.getByLabel('Request URL').fill(`http://127.0.0.1:${appPort}/delay?ms=1200`)
   await page.getByRole('button', { name: /Send/ }).click()
-  const slowTab = page.getByRole('button', { name: /GET \/delay/ })
+  const slowTab = tabByTitle(page, `GET 127.0.0.1:${appPort}/delay`)
   await slowTab.locator('.tab-spinner').waitFor({ state: 'visible', timeout: 5_000 })
   await page.keyboard.press('Control+Enter')
   await page.getByRole('button', { name: '新增 Tab' }).click()
@@ -344,9 +359,9 @@ try {
   assert.equal(requestCounts.get('/delay'), slowCountBefore + 1, 'Ctrl+Enter must not duplicate a running request')
   await slowTab.click()
   assert.match(await page.locator('.response-code').innerText(), /finished after delay/)
-  await page.getByRole('button', { name: /GET \/json/ }).last().click()
+  await tabByTitle(page, `GET 127.0.0.1:${appPort}/json`).last().click()
   assert.match(await page.locator('.response-code').innerText(), /"method": "GET"/)
-  await page.getByRole('button', { name: /GET \/status\/500/ }).last().click()
+  await tabByTitle(page, `GET 127.0.0.1:${appPort}/status/500`).last().click()
   assert.match(await page.locator('.status-pill').innerText(), /500 Internal Server Error/)
   console.log('PASS 真正 Tauri IPC：三個 Tab 各自保存 Response，延遲完成不覆蓋其他 Tab，且不重複送出')
 
@@ -416,7 +431,7 @@ try {
   await page.getByRole('button', { name: /Send/ }).click()
   await page.waitForFunction(() => document.querySelector('.response-code')?.textContent?.includes('line 1:'))
   assert.equal(await page.locator('.response-code').evaluate((element) => Number.parseFloat(getComputedStyle(element).fontSize)), 15)
-  await page.getByRole('button', { name: /GET \/long-text/ }).click()
+  await tabByTitle(page, `GET 127.0.0.1:${appPort}/long-text`).click()
   assert.equal(await page.locator('.response-code').evaluate((element) => Number.parseFloat(getComputedStyle(element).fontSize)), 15)
   console.log('PASS 真正 WebView2：切換 Tab 後 Response Source 字級一致')
 
@@ -452,7 +467,7 @@ try {
   await page.waitForFunction(({ count, id }) => document.querySelectorAll('.tabs .tab').length === count && document.querySelector('.tabs .tab-active')?.getAttribute('data-tab-id') === id, { count: expectedTabCount, id: expectedActiveTabId })
   assert.equal(await page.getByLabel('Request URL').inputValue(), expectedActiveUrl)
   await page.locator('.response-empty').waitFor({ state: 'visible' })
-  const bearerTab = page.locator('.tabs .tab').filter({ hasText: 'POST /json' }).first()
+  const bearerTab = page.locator('.tabs .tab').filter({ hasText: new RegExp(`POST 127\\.0\\.0\\.1:${appPort}/json`) }).first()
   await bearerTab.click()
   await page.getByRole('button', { name: 'Auth', exact: true }).click()
   assert.equal(await page.getByPlaceholder('Bearer token').inputValue(), 'vexa-smoke-token-never-persist')
@@ -487,7 +502,7 @@ try {
   const copiedKey = await readFile(resolve(copiedPortableDirectory, 'Data/secret.key'))
   assert.equal(copiedKey.subarray(0, 8).toString('ascii'), 'VEXAKEY1')
   assert.equal(copiedKey.length, 40)
-  const copiedSessionTab = page.locator('.tabs .tab').filter({ hasText: 'POST /json' }).first()
+  const copiedSessionTab = page.locator('.tabs .tab').filter({ hasText: new RegExp(`POST 127\\.0\\.0\\.1:${appPort}/json`) }).first()
   await copiedSessionTab.click()
   await page.getByRole('button', { name: 'Auth', exact: true }).click()
   assert.equal(await page.getByPlaceholder('Bearer token').inputValue(), 'vexa-smoke-token-never-persist')
@@ -564,7 +579,7 @@ try {
   debuggerPort = await getFreePort()
   launchApp()
   page = await connectAppPage()
-  await page.waitForFunction(() => document.querySelector('.tabs .tab')?.textContent?.includes('POST /json'))
+  await page.waitForFunction(() => document.querySelector('.tabs .tab')?.textContent?.includes('POST 127.0.0.1:') && document.querySelector('.tabs .tab')?.textContent?.includes('/json'))
   const migratedHistory = JSON.parse(await readFile(resolve(legacyDirectory, 'Data/history.json'), 'utf8'))
   const migratedSession = JSON.parse(await readFile(resolve(legacyDirectory, 'Data/session.json'), 'utf8'))
   assert.equal(migratedHistory.algorithm, 'AES-256-GCM')

@@ -41,3 +41,25 @@ export function normalizeHttpUrl(input: string): UrlNormalization {
     return { ok: false, message: 'URL 格式錯誤，請檢查網址、Port、Path 與 Query。' }
   }
 }
+
+export function formatTabTitle(method: string, input: string): string {
+  const value = input.trim()
+  if (!value) return `${method} 新請求`
+
+  const normalized = normalizeHttpUrl(value)
+  if (!normalized.ok) return `${method} 新請求`
+
+  try {
+    const parsed = new URL(normalized.value)
+    const authority = normalized.value.match(/^[a-z][a-z\d+.-]*:\/\/([^/?#]*)/i)?.[1] ?? ''
+    const hostPort = authority.slice(authority.lastIndexOf('@') + 1)
+    const explicitPort = hostPort.startsWith('[')
+      ? hostPort.match(/^\[[^\]]+\]:(\d+)$/)?.[1]
+      : hostPort.match(/^[^:]+:(\d+)$/)?.[1]
+    const path = parsed.pathname === '/' ? '' : parsed.pathname
+    const host = `${parsed.hostname}${explicitPort ? `:${explicitPort}` : ''}`
+    return `${method} ${host}${path}`
+  } catch {
+    return `${method} 新請求`
+  }
+}

@@ -7,7 +7,7 @@ import CodeEditor from './components/CodeEditor.vue'
 import JsonNode from './components/JsonNode.vue'
 import KeyValueEditor from './components/KeyValueEditor.vue'
 import { createTab, emptyBodyField, METHODS, type BodyField, type HttpError, type RequestTab, type SendResult } from './types'
-import { normalizeHttpUrl } from './url'
+import { formatTabTitle, normalizeHttpUrl } from './url'
 
 const tabs = ref<RequestTab[]>([createTab()])
 const activeId = ref(tabs.value[0]!.id)
@@ -132,13 +132,7 @@ const suggestedFileName = computed(() => {
 })
 
 function tabTitle(tab: RequestTab) {
-  const path = tab.url.trim()
-  try {
-    const parsed = new URL(path)
-    return `${tab.method} ${parsed.pathname || '/'}`
-  } catch {
-    return `${tab.method} ${path || '新請求'}`
-  }
+  return formatTabTitle(tab.method, tab.url)
 }
 function addTab() {
   const tab = createTab()
@@ -663,7 +657,7 @@ onBeforeUnmount(() => {
         <button v-if="tabsOverflow" class="tab-scroll-button" aria-label="向左捲動 Tabs" :disabled="!tabsCanScrollLeft" @click="scrollTabs(-1)">‹</button>
         <nav ref="tabsNav" class="tabs" aria-label="Request Tabs" @scroll="updateTabScrollState" @wheel="handleTabWheel">
           <button v-for="tab in tabs" :key="tab.id" :data-tab-id="tab.id" class="tab" :class="{ 'tab-active': activeId === tab.id }" @click="activateTab(tab.id)">
-            <span class="tab-state" :class="statusClass(tab)"></span><span class="tab-title">{{ tabTitle(tab) }}</span>
+            <span class="tab-state" :class="statusClass(tab)"></span><span class="tab-title" :title="tabTitle(tab)">{{ tabTitle(tab) }}</span>
             <span v-if="tab.requestState === 'running'" class="tab-spinner"></span>
             <span class="tab-close" role="button" aria-label="關閉 Tab" @click.stop="closeTab(tab.id)">×</span>
           </button>

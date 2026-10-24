@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
-import { normalizeHttpUrl } from '../../src/url'
+import { formatTabTitle, normalizeHttpUrl } from '../../src/url'
 
 type TestBridge = {
   sent: Array<{ tabId: string; executionId: string; url: string; method: string }>
@@ -171,6 +171,91 @@ test('normalizes HTTP URLs and rejects unsupported or malformed input', () => {
   expect(normalizeHttpUrl('   ')).toMatchObject({ ok: false, message: expect.stringContaining('必填') })
   expect(normalizeHttpUrl('https:///missing-host')).toMatchObject({ ok: false })
   expect(normalizeHttpUrl('example.com:70000')).toMatchObject({ ok: false })
+})
+
+test('uses one safe Tab title for edits, sends, status changes, History and long URLs', async ({ page }) => {
+  const title = page.locator('.tab-active .tab-title')
+  const url = page.getByLabel('Request URL')
+  await expect(title).toHaveText('GET 新請求')
+  expect(formatTabTitle('GET', '   ')).toBe('GET 新請求')
+
+  await url.fill('https://google.com')
+  await expect(title).toHaveText('GET google.com')
+  await expect(title).toHaveAttribute('title', 'GET google.com')
+  await page.getByRole('button', { name: /Send/ }).click()
+  await expect(page.locator('.status-pill')).toContainText('200 OK')
+  await expect(title).toHaveText('GET google.com')
+  await expect(url).toHaveValue('https://google.com')
+
+  await page.locator('.method-select').selectOption('POST')
+  await url.fill('https://api.example.com/users?token=private-query#details')
+  await expect(title).toHaveText('POST api.example.com/users')
+  await expect(title).not.toContainText('private-query')
+  await page.getByRole('button', { name: /Send/ }).click()
+  await expect(page.locator('.status-pill')).toContainText('200 OK')
+  await expect(title).toHaveText('POST api.example.com/users')
+
+  await page.locator('.method-select').selectOption('GET')
+  await url.fill('https://google.com/?secret=not-for-title')
+  await expect(title).toHaveText('GET google.com')
+  await url.fill('https://api.example.com:8443/users')
+  await expect(title).toHaveText('GET api.example.com:8443/users')
+  await url.fill('https://api.example.com:443/users')
+  await expect(title).toHaveText('GET api.example.com:443/users')
+  await url.fill('https://user:password@example.com/private?token=not-for-title')
+  await expect(title).toHaveText('GET example.com/private')
+  await expect(title).not.toContainText('password')
+  await expect(title).not.toContainText('not-for-title')
+
+  for (const status of [200, 404, 500]) {
+    await url.fill(`http://mock/status/${status}`)
+    const beforeSend = `GET mock/status/${status}`
+    await expect(title).toHaveText(beforeSend)
+    await page.getByRole('button', { name: /Send/ }).click()
+    await expect(page.locator('.status-pill')).toContainText(`${status} `)
+    await expect(title).toHaveText(beforeSend)
+  }
+
+  await url.fill('google.com')
+  await expect(title).toHaveText('GET google.com')
+  await page.getByRole('button', { name: /Send/ }).click()
+  await expect(url).toHaveValue('https://google.com')
+  await expect(title).toHaveText('GET google.com')
+
+  const longPath = `/users/${'very-long-segment-'.repeat(30)}`
+  await url.fill(`https://api.example.com${longPath}`)
+  const longTitle = `GET api.example.com${longPath}`
+  await expect(title).toHaveText(longTitle)
+  await expect(title).toHaveAttribute('title', longTitle)
+  const layout = await page.evaluate(() => {
+    const text = document.querySelector<HTMLElement>('.tab-active .tab-title')!
+    const tab = text.closest<HTMLElement>('.tab')!
+    const nav = document.querySelector<HTMLElement>('.tabs')!
+    return { titleClientWidth: text.clientWidth, titleScrollWidth: text.scrollWidth, textOverflow: getComputedStyle(text).textOverflow, tabWidth: tab.getBoundingClientRect().width, navClientWidth: nav.clientWidth }
+  })
+  expect(layout.titleScrollWidth).toBeGreaterThan(layout.titleClientWidth)
+  expect(layout.textOverflow).toBe('ellipsis')
+  expect(layout.tabWidth).toBeLessThanOrEqual(225)
+  expect(layout.navClientWidth).toBeGreaterThan(0)
+
+  await page.getByRole('button', { name: '新增 Tab' }).click()
+  await expect(page.locator('.tab-active .tab-title')).toHaveText('GET 新請求')
+  await page.getByLabel('Request URL').fill('http://mock/fast')
+  await expect(page.locator('.tab-active .tab-title')).toHaveText('GET mock/fast')
+  await page.locator('.tabs .tab').first().click()
+  await expect(page.locator('.tab-active .tab-title')).toHaveText(longTitle)
+  await page.reload()
+  await expect(page.locator('.tabs .tab')).toHaveCount(2)
+  await expect(page.locator('.tab-active .tab-title')).toHaveText(longTitle)
+  await expect.poll(() => page.evaluate(() => JSON.parse(sessionStorage.getItem('__vexa_session') ?? '{"tabs":[]}').tabs.length)).toBe(2)
+  await page.locator('.tabs .tab').nth(1).click()
+  await expect(page.locator('.tab-active .tab-title')).toHaveText('GET mock/fast')
+  await page.getByRole('button', { name: /Send/ }).click()
+  await expect(page.locator('.status-pill')).toContainText('200 OK')
+  await expect.poll(() => page.evaluate(() => JSON.parse(sessionStorage.getItem('__vexa_history') ?? '[]').length)).toBeGreaterThan(0)
+  await page.getByRole('button', { name: 'History' }).click()
+  await page.locator('.history-entry').first().click()
+  await expect(page.locator('.tab-active .tab-title')).toHaveText('GET mock/fast')
 })
 
 test('keeps the icon-only brand, theme contrast, scalable text and JSON-backed font preference', async ({ page }) => {
@@ -547,7 +632,7 @@ test('scales only Response Source with Ctrl+Wheel and persists its independent s
   const secondSource = page.locator('.response-code')
   await expect(secondSource).toBeVisible()
   expect(await secondSource.evaluate((element) => Number.parseFloat(getComputedStyle(element).fontSize))).toBe(15)
-  await page.getByRole('button', { name: /GET \/long-text/ }).click()
+  await page.getByRole('button', { name: /GET mock\/long-text/ }).click()
   expect(await page.locator('.response-code').evaluate((element) => Number.parseFloat(getComputedStyle(element).fontSize))).toBe(15)
 
   await page.reload()
@@ -649,7 +734,7 @@ test('switches JSON, XML, HTML and binary viewer modes safely', async ({ page })
 test('keeps three tab responses isolated when requests finish out of order', async ({ page }) => {
   await page.getByLabel('Request URL').fill('http://mock/slow')
   await page.getByRole('button', { name: /Send/ }).click()
-  const slowTab = page.getByRole('button', { name: /GET \/slow/ })
+  const slowTab = page.getByRole('button', { name: /GET mock\/slow/ })
   await expect(slowTab.locator('.tab-spinner')).toBeVisible()
 
   await page.getByRole('button', { name: '新增 Tab' }).click()
@@ -665,9 +750,9 @@ test('keeps three tab responses isolated when requests finish out of order', asy
   await expect(slowTab.locator('.tab-spinner')).toBeHidden()
   await slowTab.click()
   await expect(page.locator('.response-code')).toContainText('slow result')
-  await page.getByRole('button', { name: /GET \/fast/ }).click()
+  await page.getByRole('button', { name: /GET mock\/fast/ }).click()
   await expect(page.locator('.response-code')).toContainText('fast result')
-  await page.getByRole('button', { name: /GET \/error/ }).click()
+  await page.getByRole('button', { name: /GET mock\/error/ }).click()
   await expect(page.locator('.response-code')).toContainText('fixture error')
 })
 
