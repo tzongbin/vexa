@@ -15,6 +15,7 @@
         "title": "Vexa",
         "width": 1440,
         "height": 900,
+        "visible": false,
         "minWidth": 900,
         "minHeight": 620,
         "resizable": true

@@ -3,7 +3,10 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -20,7 +23,7 @@ use reqwest::{
     Method, Url,
 };
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{Manager, State, WindowEvent};
 use tokio_util::sync::CancellationToken;
 
 const MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
@@ -42,6 +45,11 @@ const HISTORY_LIMITS: [usize; 5] = [100, 500, 1_000, 5_000, 10_000];
 const DEFAULT_REQUEST_WIDTH_PERCENT: f64 = 50.0;
 const MIN_REQUEST_WIDTH_PERCENT: f64 = 15.0;
 const MAX_REQUEST_WIDTH_PERCENT: f64 = 85.0;
+const MIN_WINDOW_WIDTH: f64 = 900.0;
+const MIN_WINDOW_HEIGHT: f64 = 620.0;
+const MAX_WINDOW_DIMENSION: f64 = 16_384.0;
+const MAX_WINDOW_COORDINATE: i32 = 2_000_000;
+const WINDOW_SAVE_DEBOUNCE: Duration = Duration::from_millis(350);
 
 fn default_request_width_percent() -> f64 {
     DEFAULT_REQUEST_WIDTH_PERCENT
@@ -110,13 +118,39 @@ impl Default for AppearanceSettings {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UiSettings {
     version: u32,
     appearance: AppearanceSettings,
     #[serde(default = "default_history_limit")]
     history_limit: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    window: Option<WindowSettings>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WindowSettings {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    maximized: bool,
+    scale_factor: f64,
+}
+
+impl WindowSettings {
+    fn is_valid(&self) -> bool {
+        self.x.unsigned_abs() <= MAX_WINDOW_COORDINATE as u32
+            && self.y.unsigned_abs() <= MAX_WINDOW_COORDINATE as u32
+            && self.scale_factor.is_finite()
+            && (0.5..=8.0).contains(&self.scale_factor)
+            && (MIN_WINDOW_WIDTH..=MAX_WINDOW_DIMENSION)
+                .contains(&(f64::from(self.width) / self.scale_factor))
+            && (MIN_WINDOW_HEIGHT..=MAX_WINDOW_DIMENSION)
+                .contains(&(f64::from(self.height) / self.scale_factor))
+    }
 }
 
 const fn default_history_limit() -> usize {
@@ -133,6 +167,7 @@ impl Default for UiSettings {
             version: settings_version(),
             appearance: AppearanceSettings::default(),
             history_limit: default_history_limit(),
+            window: None,
         }
     }
 }
@@ -212,11 +247,18 @@ fn read_ui_settings_at(path: &PathBuf, legacy: Option<LegacyUiSettings>) -> UiSe
     }
     match fs::read_to_string(path) {
         Ok(contents) => match serde_json::from_str::<UiSettings>(&contents) {
-            Ok(settings)
+            Ok(mut settings)
                 if settings.version == settings_version()
                     && valid_source_size(settings.appearance.source_font_size)
                     && valid_history_limit(settings.history_limit) =>
             {
+                if settings
+                    .window
+                    .as_ref()
+                    .is_some_and(|window| !window.is_valid())
+                {
+                    settings.window = None;
+                }
                 UiSettingsLoadResult {
                     settings,
                     migrated: false,
@@ -324,10 +366,15 @@ fn write_ui_settings_file(path: &PathBuf, settings: &UiSettings) -> Result<(), S
     if settings.version != settings_version()
         || !valid_source_size(settings.appearance.source_font_size)
         || !valid_history_limit(settings.history_limit)
+        || settings
+            .window
+            .as_ref()
+            .is_some_and(|window| !window.is_valid())
     {
         return Err("設定值超出允許範圍。".into());
     }
     let directory = path.parent().ok_or_else(|| "設定資料夾無效。".to_owned())?;
+    let mut merged = settings.clone();
     match fs::read_to_string(path) {
         Ok(contents) => {
             let existing = serde_json::from_str::<UiSettings>(&contents)
@@ -338,10 +385,45 @@ fn write_ui_settings_file(path: &PathBuf, settings: &UiSettings) -> Result<(), S
             {
                 return Err("現有設定檔版本或字級範圍不支援，為保留原始檔案，本次不覆寫。".into());
             }
+            if merged.window.is_none() {
+                merged.window = existing.window.filter(|window| window.is_valid());
+            }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("無法讀取現有設定檔：{error}")),
     }
+    write_settings_atomically(path, &merged, directory)
+}
+
+fn write_window_settings_file(path: &PathBuf, window: &WindowSettings) -> Result<(), String> {
+    if !window.is_valid() {
+        return Err("視窗設定值超出允許範圍。".into());
+    }
+    let directory = path.parent().ok_or_else(|| "設定資料夾無效。".to_owned())?;
+    let mut settings = match fs::read_to_string(path) {
+        Ok(contents) => {
+            let existing = serde_json::from_str::<UiSettings>(&contents)
+                .map_err(|_| "現有設定檔格式錯誤，為保留原始檔案，本次不覆寫。".to_owned())?;
+            if existing.version != settings_version()
+                || !valid_source_size(existing.appearance.source_font_size)
+                || !valid_history_limit(existing.history_limit)
+            {
+                return Err("現有設定檔版本或偏好欄位無效，為保留原始檔案，本次不覆寫。".into());
+            }
+            existing
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => UiSettings::default(),
+        Err(error) => return Err(format!("無法讀取現有設定檔：{error}")),
+    };
+    settings.window = Some(window.clone());
+    write_settings_atomically(path, &settings, directory)
+}
+
+fn write_settings_atomically(
+    path: &PathBuf,
+    settings: &UiSettings,
+    directory: &Path,
+) -> Result<(), String> {
     fs::create_dir_all(directory).map_err(|error| format!("無法建立 Data 資料夾：{error}"))?;
     let bytes =
         serde_json::to_vec_pretty(settings).map_err(|error| format!("無法編碼設定：{error}"))?;
@@ -379,6 +461,236 @@ fn write_ui_settings_file(path: &PathBuf, settings: &UiSettings) -> Result<(), S
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MonitorArea {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    scale_factor: f64,
+    primary: bool,
+}
+
+fn resolve_window_settings(
+    saved: Option<&WindowSettings>,
+    monitors: &[MonitorArea],
+) -> Option<WindowSettings> {
+    let saved = saved.filter(|settings| settings.is_valid())?;
+    if monitors.is_empty() {
+        return None;
+    }
+
+    let saved_left = i64::from(saved.x);
+    let saved_top = i64::from(saved.y);
+    let saved_right = saved_left + i64::from(saved.width);
+    let saved_bottom = saved_top + i64::from(saved.height);
+    let overlap = |monitor: &&MonitorArea| {
+        let left = saved_left.max(i64::from(monitor.x));
+        let top = saved_top.max(i64::from(monitor.y));
+        let right = saved_right.min(i64::from(monitor.x) + i64::from(monitor.width));
+        let bottom = saved_bottom.min(i64::from(monitor.y) + i64::from(monitor.height));
+        (right - left).max(0) * (bottom - top).max(0)
+    };
+    let selected = monitors
+        .iter()
+        .filter(|monitor| {
+            monitor.width > 0 && monitor.height > 0 && monitor.scale_factor.is_finite()
+        })
+        .max_by_key(overlap)
+        .filter(|monitor| overlap(monitor) > 0)
+        .or_else(|| monitors.iter().find(|monitor| monitor.primary))
+        .or_else(|| monitors.first())?;
+
+    let scale_factor = if (0.5..=8.0).contains(&selected.scale_factor) {
+        selected.scale_factor
+    } else {
+        saved.scale_factor
+    };
+    let scaled = |physical: u32, minimum: f64| {
+        ((f64::from(physical) / saved.scale_factor * scale_factor).round())
+            .clamp(minimum * scale_factor, MAX_WINDOW_DIMENSION * scale_factor) as u32
+    };
+    let width = scaled(saved.width, MIN_WINDOW_WIDTH).min(selected.width.max(1));
+    let height = scaled(saved.height, MIN_WINDOW_HEIGHT).min(selected.height.max(1));
+    let centered = overlap(&selected) == 0;
+    let x = if centered {
+        i64::from(selected.x) + (i64::from(selected.width) - i64::from(width)).max(0) / 2
+    } else {
+        i64::from(saved.x).clamp(
+            i64::from(selected.x),
+            (i64::from(selected.x) + i64::from(selected.width) - i64::from(width))
+                .max(i64::from(selected.x)),
+        )
+    };
+    let y = if centered {
+        i64::from(selected.y) + (i64::from(selected.height) - i64::from(height)).max(0) / 2
+    } else {
+        i64::from(saved.y).clamp(
+            i64::from(selected.y),
+            (i64::from(selected.y) + i64::from(selected.height) - i64::from(height))
+                .max(i64::from(selected.y)),
+        )
+    };
+
+    Some(WindowSettings {
+        x: x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        y: y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        width,
+        height,
+        maximized: saved.maximized,
+        scale_factor,
+    })
+}
+
+fn monitor_areas(window: &tauri::WebviewWindow) -> Vec<MonitorArea> {
+    let Ok(monitors) = window.available_monitors() else {
+        return Vec::new();
+    };
+    let primary_position = window
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| *monitor.position());
+    monitors
+        .into_iter()
+        .map(|monitor| {
+            let work_area = monitor.work_area();
+            MonitorArea {
+                x: work_area.position.x,
+                y: work_area.position.y,
+                width: work_area.size.width,
+                height: work_area.size.height,
+                scale_factor: monitor.scale_factor(),
+                primary: primary_position == Some(*monitor.position()),
+            }
+        })
+        .collect()
+}
+
+fn geometry_fills_monitor(settings: &WindowSettings, monitors: &[MonitorArea]) -> bool {
+    monitors.iter().any(|monitor| {
+        (i64::from(settings.x) - i64::from(monitor.x)).abs() <= 32
+            && (i64::from(settings.y) - i64::from(monitor.y)).abs() <= 32
+            && i64::from(settings.width) >= i64::from(monitor.width) - 48
+            && i64::from(settings.height) >= i64::from(monitor.height) - 128
+    })
+}
+
+fn window_geometry_fills_monitor(window: &tauri::WebviewWindow, settings: &WindowSettings) -> bool {
+    geometry_fills_monitor(settings, &monitor_areas(window))
+}
+
+fn apply_saved_window(
+    window: &tauri::WebviewWindow,
+    saved: Option<&WindowSettings>,
+) -> Option<WindowSettings> {
+    let monitors = monitor_areas(window);
+    let restored = resolve_window_settings(saved, &monitors);
+    let Some(restored) = restored.as_ref() else {
+        let _ = window.center();
+        return None;
+    };
+    let size = tauri::PhysicalSize::new(restored.width, restored.height);
+    let position = tauri::PhysicalPosition::new(restored.x, restored.y);
+    if window.set_size(size).is_err() || window.set_position(position).is_err() {
+        let _ = window.center();
+        return None;
+    }
+    if restored.maximized {
+        let _ = window.maximize();
+    }
+    Some(restored.clone())
+}
+
+#[derive(Default)]
+struct WindowSaveState {
+    latest: Mutex<Option<WindowSettings>>,
+    generation: AtomicU64,
+}
+
+fn current_window_settings(window: &tauri::WebviewWindow) -> Option<WindowSettings> {
+    let position = window.outer_position().ok()?;
+    let size = window.inner_size().ok()?;
+    let settings = WindowSettings {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+        maximized: window.is_maximized().ok()?,
+        scale_factor: window.scale_factor().ok()?,
+    };
+    settings.is_valid().then_some(settings)
+}
+
+fn queue_window_settings_save(
+    window: tauri::WebviewWindow,
+    state: &Arc<WindowSaveState>,
+    store: Arc<Mutex<()>>,
+) {
+    let generation = state.generation.fetch_add(1, Ordering::AcqRel) + 1;
+    let state = Arc::clone(state);
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(WINDOW_SAVE_DEBOUNCE).await;
+        if state.generation.load(Ordering::Acquire) != generation
+            || window.is_minimized().unwrap_or(false)
+        {
+            return;
+        }
+        let current = if window.is_maximized().unwrap_or(false) {
+            let mut current = state.latest.lock().ok().and_then(|value| value.clone());
+            if let Some(current) = current.as_mut() {
+                current.maximized = true;
+            }
+            current
+        } else {
+            current_window_settings(&window)
+        };
+        let Some(current) = current else {
+            return;
+        };
+        if state.generation.load(Ordering::Acquire) != generation {
+            return;
+        }
+        if let Ok(mut latest) = state.latest.lock() {
+            *latest = Some(current.clone());
+        }
+        let _ = run_store_task(move || {
+            let Ok(_guard) = store.lock() else { return };
+            if state.generation.load(Ordering::Acquire) != generation {
+                return;
+            }
+            let Ok(path) = settings_path() else { return };
+            let Ok(_file_lock) = lock_data_store_for(&path) else {
+                return;
+            };
+            if state.generation.load(Ordering::Acquire) != generation {
+                return;
+            }
+            let _ = write_window_settings_file(&path, &current);
+        })
+        .await;
+    });
+}
+
+fn flush_window_settings_save(state: &Arc<WindowSaveState>, store: &Arc<Mutex<()>>) {
+    let generation = state.generation.fetch_add(1, Ordering::AcqRel) + 1;
+    let Some(current) = state.latest.lock().ok().and_then(|value| value.clone()) else {
+        return;
+    };
+    let Ok(_guard) = store.lock() else { return };
+    if state.generation.load(Ordering::Acquire) != generation {
+        return;
+    }
+    let Ok(path) = settings_path() else { return };
+    let Ok(_file_lock) = lock_data_store_for(&path) else {
+        return;
+    };
+    if state.generation.load(Ordering::Acquire) != generation {
+        return;
+    }
+    let _ = write_window_settings_file(&path, &current);
 }
 
 #[tauri::command]
@@ -1932,6 +2244,68 @@ pub fn run() {
         .manage(JsonStoreWriteState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .setup(|app| {
+            let store = Arc::clone(&app.state::<JsonStoreWriteState>().0);
+            let saved = read_ui_settings(None).settings.window;
+            if let Some(window) = app.get_webview_window("main") {
+                let restored = apply_saved_window(&window, saved.as_ref());
+                let save_state = Arc::new(WindowSaveState::default());
+                if let Ok(mut latest) = save_state.latest.lock() {
+                    *latest = restored.or_else(|| current_window_settings(&window));
+                }
+
+                let event_window = window.clone();
+                let event_state = Arc::clone(&save_state);
+                let event_store = Arc::clone(&store);
+                window.on_window_event(move |event| match event {
+                    WindowEvent::Moved(_)
+                    | WindowEvent::Resized(_)
+                    | WindowEvent::ScaleFactorChanged { .. } => {
+                        if !event_window.is_minimized().unwrap_or(false) {
+                            if event_window.is_maximized().unwrap_or(false) {
+                                if let Ok(mut latest) = event_state.latest.lock() {
+                                    if let Some(current) = latest.as_mut() {
+                                        current.maximized = true;
+                                    }
+                                }
+                            } else if let Some(mut current) = current_window_settings(&event_window)
+                            {
+                                if !window_geometry_fills_monitor(&event_window, &current) {
+                                    current.maximized = false;
+                                    if let Ok(mut latest) = event_state.latest.lock() {
+                                        *latest = Some(current);
+                                    }
+                                }
+                            }
+                        }
+                        queue_window_settings_save(
+                            event_window.clone(),
+                            &event_state,
+                            Arc::clone(&event_store),
+                        );
+                    }
+                    WindowEvent::CloseRequested { .. } => {
+                        if !event_window.is_minimized().unwrap_or(false) {
+                            if event_window.is_maximized().unwrap_or(false) {
+                                if let Ok(mut latest) = event_state.latest.lock() {
+                                    if let Some(current) = latest.as_mut() {
+                                        current.maximized = true;
+                                    }
+                                }
+                            } else if let Some(current) = current_window_settings(&event_window) {
+                                if let Ok(mut latest) = event_state.latest.lock() {
+                                    *latest = Some(current);
+                                }
+                            }
+                        }
+                        flush_window_settings_save(&event_state, &event_store);
+                    }
+                    _ => {}
+                });
+                window.show()?;
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             send_request,
             validate_multipart_files,
@@ -2033,9 +2407,154 @@ mod tests {
                 font_size: UiFontSize::Xlarge,
                 source_font_size: None,
             },
+            window: None,
         };
         write_ui_settings_file(&path, &changed).unwrap();
         assert_eq!(read_ui_settings_at(&path, None).settings, changed);
+    }
+
+    fn window_settings(
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        maximized: bool,
+        scale: f64,
+    ) -> WindowSettings {
+        WindowSettings {
+            x,
+            y,
+            width,
+            height,
+            maximized,
+            scale_factor: scale,
+        }
+    }
+
+    #[test]
+    fn window_settings_merge_without_overwriting_existing_preferences() {
+        let directory = TempDirectory::new("window-settings-merge");
+        let path = directory.0.join("Data").join(SETTINGS_FILE_NAME);
+        let first = window_settings(-1200, 80, 1600, 1000, false, 1.0);
+        write_window_settings_file(&path, &first).unwrap();
+
+        let appearance = UiSettings {
+            version: 1,
+            appearance: AppearanceSettings {
+                theme: UiTheme::Dark,
+                font_size: UiFontSize::Small,
+                source_font_size: Some(18),
+            },
+            history_limit: 5_000,
+            window: None,
+        };
+        write_ui_settings_file(&path, &appearance).unwrap();
+        let loaded = read_ui_settings_at(&path, None).settings;
+        assert_eq!(loaded.appearance, appearance.appearance);
+        assert_eq!(loaded.history_limit, 5_000);
+        assert_eq!(loaded.window, Some(first.clone()));
+
+        let second = window_settings(-1400, 100, 1800, 1100, true, 1.25);
+        write_window_settings_file(&path, &second).unwrap();
+        let loaded = read_ui_settings_at(&path, None).settings;
+        assert_eq!(loaded.appearance, appearance.appearance);
+        assert_eq!(loaded.history_limit, 5_000);
+        assert_eq!(loaded.window, Some(second));
+    }
+
+    #[test]
+    fn window_restore_keeps_negative_monitor_coordinates_and_scales_for_dpi() {
+        let negative_monitor = MonitorArea {
+            x: -1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            scale_factor: 1.0,
+            primary: false,
+        };
+        let primary = MonitorArea {
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 1440,
+            scale_factor: 1.5,
+            primary: true,
+        };
+        let negative = window_settings(-1700, 100, 1600, 1000, false, 1.0);
+        let restored =
+            resolve_window_settings(Some(&negative), &[negative_monitor, primary]).unwrap();
+        assert_eq!((restored.x, restored.y), (-1700, 80));
+        assert_eq!((restored.width, restored.height), (1600, 1000));
+
+        let on_primary = window_settings(100, 100, 2400, 1500, false, 2.0);
+        let restored =
+            resolve_window_settings(Some(&on_primary), &[negative_monitor, primary]).unwrap();
+        assert_eq!((restored.width, restored.height), (1800, 1125));
+        assert_eq!(restored.scale_factor, 1.5);
+    }
+
+    #[test]
+    fn missing_disconnected_or_invalid_window_settings_fall_back_to_visible_geometry() {
+        let primary = MonitorArea {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            scale_factor: 1.0,
+            primary: true,
+        };
+        assert!(resolve_window_settings(None, &[primary]).is_none());
+        assert!(resolve_window_settings(
+            Some(&window_settings(0, 0, 800, 600, false, 1.0)),
+            &[primary]
+        )
+        .is_none());
+        assert!(resolve_window_settings(
+            Some(&window_settings(i32::MIN, 0, 1440, 900, false, 1.0)),
+            &[primary]
+        )
+        .is_none());
+        assert!(resolve_window_settings(
+            Some(&window_settings(0, 0, 1440, 900, false, f64::INFINITY)),
+            &[primary]
+        )
+        .is_none());
+
+        let unplugged = window_settings(3000, 2000, 1200, 800, false, 1.0);
+        let restored = resolve_window_settings(Some(&unplugged), &[primary]).unwrap();
+        assert_eq!((restored.x, restored.y), (360, 140));
+        assert!(restored.x >= primary.x && restored.y >= primary.y);
+        assert!(restored.x + restored.width as i32 <= primary.width as i32);
+        assert!(restored.y + restored.height as i32 <= primary.height as i32);
+
+        let maximized_bounds = window_settings(0, 0, 1900, 1000, false, 1.0);
+        assert!(geometry_fills_monitor(&maximized_bounds, &[primary]));
+        let normal_bounds = window_settings(180, 120, 1320, 800, false, 1.0);
+        assert!(!geometry_fills_monitor(&normal_bounds, &[primary]));
+    }
+
+    #[test]
+    fn invalid_window_geometry_is_ignored_without_losing_valid_settings() {
+        let directory = TempDirectory::new("window-settings-validation");
+        let path = directory.0.join(SETTINGS_FILE_NAME);
+        let json = r#"{"version":1,"appearance":{"theme":"dark","fontSize":"small","sourceFontSize":18},"historyLimit":5000,"window":{"x":999999999,"y":-120,"width":1600,"height":900,"maximized":false,"scaleFactor":1.0}}"#;
+        std::fs::write(&path, json).unwrap();
+        let loaded = read_ui_settings_at(&path, None);
+        assert_eq!(loaded.settings.appearance.theme, UiTheme::Dark);
+        assert_eq!(loaded.settings.appearance.font_size, UiFontSize::Small);
+        assert_eq!(loaded.settings.history_limit, 5_000);
+        assert_eq!(loaded.settings.window, None);
+        assert!(loaded.warning.is_none());
+    }
+
+    #[test]
+    fn window_save_generations_discard_stale_debounced_writes() {
+        let state = WindowSaveState::default();
+        let old_generation = state.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let new_generation = state.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        assert_ne!(old_generation, new_generation);
+        assert_ne!(state.generation.load(Ordering::Acquire), old_generation);
+        assert_eq!(state.generation.load(Ordering::Acquire), new_generation);
     }
 
     #[test]

@@ -60,7 +60,7 @@ npm run test:tauri
 
 正式 Windows 執行檔輸出於 `src-tauri\target\release\vexa.exe`。設定、History 或 Session 首次寫入時建立 EXE 同目錄的 `Data` 資料夾；預設值不會建立 JSON 檔。攜帶資料時請一併複製 EXE 與 `Data` 資料夾。開發模式依 Debug 執行檔位置，在 `src-tauri\target\debug\Data` 使用獨立資料。所有模式都不依賴目前工作目錄。JSON 寫入採暫存檔與原子替換；損壞檔案保留原樣並提示。若需要 NSIS 安裝包，執行 `npm run tauri build`，輸出位於 `src-tauri\target\release\bundle\nsis`。
 
-設定內容只包含主題、全域字級及 Response Source 字級。舊版 `vexa.ui.fontSize`、`vexa.ui.theme` 與 `vexa.response.sourceFontSize` 只會在尚無 JSON 時遷移；JSON 優先。損壞或不支援版本的 JSON 會保留原檔並顯示提示，必須先手動修復才能保存後續變更。
+設定內容包含主題、全域字級、Response Source 字級、History 上限及選用的視窗狀態。舊版 `vexa.ui.fontSize`、`vexa.ui.theme` 與 `vexa.response.sourceFontSize` 只會在尚無 JSON 時遷移；JSON 優先。損壞或不支援版本的 JSON 會保留原檔並顯示提示，必須先手動修復才能保存後續變更。
 
 ```json
 {
@@ -70,9 +70,19 @@ npm run test:tauri
     "fontSize": "large",
     "sourceFontSize": null
   },
-  "historyLimit": 1000
+  "historyLimit": 1000,
+  "window": {
+    "x": 200,
+    "y": 150,
+    "width": 1600,
+    "height": 1000,
+    "maximized": false,
+    "scaleFactor": 1.0
+  }
 }
 ```
+
+`window` 欄位會在視窗移動、縮放或關閉時以 Debounce 寫入同一個設定檔；視窗首次啟動時仍採原本 1440 × 900 並置中。`x` / `y` 是 Tauri `outer_position()` 回報的桌面實體像素座標，可為負值；`width` / `height` 是 `inner_size()` 的實體像素尺寸。`scaleFactor` 記錄該螢幕的 DPI 比例，移至不同縮放比例或複製到另一台電腦時，依邏輯尺寸換算視窗大小。位置會以目前可用螢幕校正，避免整個視窗落在螢幕之外。最大化旗標獨立於最後一般視窗位置及尺寸保存；最小化狀態不保存。
 
 `settings.json` 保持一般 JSON 格式，僅保存 UI 偏好與 History 上限。`history.json` 與 `session.json` 保留 `.json` 副檔名，但檔案內容是 AES-256-GCM 加密封裝，不含明文 Request。封裝包含版本、演算法、每次加密新產生的 96-bit Nonce，以及 Base64 Ciphertext（包含認證標籤）；檔案種類、版本和演算法由 AAD 認證。Rust 使用 RustCrypto `aes-gcm` 0.10.3 執行加解密，Vue 不會取得金鑰。
 
@@ -89,6 +99,7 @@ Windows 應用使用 WebView2；Tauri 設定會在安裝包流程加入 Evergree
 ## v0.2.1 功能
 
 - Compact Layout：Tab Bar 與 Request / Response 標題列依全域字級縮放保持精簡；新增 Tab 按鈕固定跟隨最後一個 Tab，多 Tab 時可水平捲動。
+- 自動保存主視窗的位置、大小及最大化狀態；依多螢幕實體座標和 DPI 比例還原，失效座標會校正至可見螢幕。
 - Request / Response 左右分割、拖曳調整比例、深色/淺色/跟隨系統主題；藍色互動主題及 2xx/3xx/4xx/5xx 語意色彩。主題、字級及 Source 個別字級自動保存於 Portable JSON 設定檔。
 - Small 14px、Normal 16px、Large 18px、XLarge 20px 四級 UI 字體大小；預設 Large。Response Source 可用 Ctrl+滾輪逐次調整 12–32px，預設跟隨全域字級，個別調整後獨立保存並套用所有 Tabs。
 - 藍色雙向資料交換 Logo；原始資產為 `public\vexa-logo.svg`，同一圖樣產生 Tauri Windows ICO、工作列/視窗圖示與平台圖示。

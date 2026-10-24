@@ -99,6 +99,21 @@ function launchApp() {
   child.stderr?.on('data', (chunk) => { stderr = `${stderr}${chunk}`.slice(-4000) })
 }
 
+async function controlNativeWindow({ x = 0, y = 0, width = 0, height = 0, mode = 'read' } = {}) {
+  const command = `Add-Type -AssemblyName System.Windows.Forms; Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public struct VexaRect { public int Left; public int Top; public int Right; public int Bottom; } public static class VexaWindowApi { [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd, out VexaRect rect); [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int width, int height, uint flags); [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int command); [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr hwnd); }'; $p = Get-Process -Id ${child.pid}; $h = $p.MainWindowHandle; if ($h -eq [IntPtr]::Zero) { throw 'Vexa main window handle unavailable' }; if ('${mode}' -eq 'bounds') { [VexaWindowApi]::ShowWindow($h, 9) | Out-Null; [VexaWindowApi]::SetWindowPos($h, [IntPtr]::Zero, ${x}, ${y}, ${width}, ${height}, 0x14) | Out-Null } elseif ('${mode}' -eq 'burst') { for ($i = 0; $i -lt 6; $i++) { [VexaWindowApi]::SetWindowPos($h, [IntPtr]::Zero, ${x} + ($i * 10), ${y} + ($i * 5), ${width} + ($i * 10), ${height} + ($i * 8), 0x14) | Out-Null; Start-Sleep -Milliseconds 40 } } elseif ('${mode}' -eq 'maximize') { [VexaWindowApi]::ShowWindow($h, 3) | Out-Null } elseif ('${mode}' -eq 'restore') { [VexaWindowApi]::ShowWindow($h, 9) | Out-Null }; Start-Sleep -Milliseconds 250; $r = New-Object VexaRect; [VexaWindowApi]::GetWindowRect($h, [ref]$r) | Out-Null; $max = [VexaWindowApi]::IsZoomed($h); $work = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea; Write-Output ("$($r.Left),$($r.Top),$($r.Right - $r.Left),$($r.Bottom - $r.Top),$max,$($work.X),$($work.Y),$($work.Width),$($work.Height)")`
+  const { stdout } = await execFileAsync('powershell', ['-NoProfile', '-Command', command], { windowsHide: true })
+  const [left, top, actualWidth, actualHeight, maximized, screenX, screenY, screenWidth, screenHeight] = stdout.trim().split(',')
+  return { x: Number(left), y: Number(top), width: Number(actualWidth), height: Number(actualHeight), maximized: maximized === 'True', screenX: Number(screenX), screenY: Number(screenY), screenWidth: Number(screenWidth), screenHeight: Number(screenHeight) }
+}
+
+async function startPortableApp(directory) {
+  executable = resolve(directory, 'vexa.exe')
+  profileDirectory = await createTemporaryDirectory('vexa-window-webview2-')
+  debuggerPort = await getFreePort()
+  launchApp()
+  return connectAppPage()
+}
+
 async function connectAppPage() {
   await waitForDevTools(debuggerPort, child)
   let connectionError
@@ -200,14 +215,16 @@ async function createTemporaryDirectory(prefix) {
 }
 
 async function waitForSettings(path, predicate) {
+  let lastValue = null
   for (let attempt = 0; attempt < 100; attempt += 1) {
     try {
       const settings = JSON.parse(await readFile(path, 'utf8'))
+      lastValue = settings
       if (predicate(settings)) return settings
     } catch { /* The first atomic save may not have completed yet. */ }
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 50))
   }
-  throw new Error(`Settings file did not reach the expected state: ${path}`)
+  throw new Error(`Settings file did not reach the expected state: ${path}; last value: ${JSON.stringify(lastValue)}`)
 }
 
 async function waitForJsonFile(path, predicate) {
@@ -249,6 +266,12 @@ try {
   let settingsExists = true
   try { await readFile(settingsPath) } catch (error) { if (error?.code === 'ENOENT') settingsExists = false; else throw error }
   assert.equal(settingsExists, false, 'default preferences must not create Data/settings.json')
+  const defaultWindow = await controlNativeWindow()
+  assert(!defaultWindow.maximized)
+  assert(Math.abs(defaultWindow.width - 1440) <= 40, 'first launch should use the configured 1440px default width')
+  assert(defaultWindow.height >= 900 && defaultWindow.height <= 980, 'first launch should use the configured 900px default height plus native frame')
+  assert(Math.abs(defaultWindow.x + defaultWindow.width / 2 - (defaultWindow.screenX + defaultWindow.screenWidth / 2)) <= 24)
+  assert(Math.abs(defaultWindow.y + defaultWindow.height / 2 - (defaultWindow.screenY + defaultWindow.screenHeight / 2)) <= 32)
   await page.evaluate(() => {
     localStorage.setItem('vexa.ui.fontSize', 'small')
     localStorage.setItem('vexa.ui.theme', 'dark')
@@ -633,6 +656,88 @@ try {
   assert.equal(await page.getByPlaceholder('Bearer token').inputValue(), '')
   assert.equal([...requestCounts.values()].reduce((sum, count) => sum + count, 0), requestCountBeforeLegacyRestore)
   console.log('PASS v0.2.0 遷移：History/Session 明文驗證後加密，遮罩 Token 保持缺漏並提示檢查')
+
+  await browser.close().catch(() => undefined)
+  browser = undefined
+  await stopApp()
+
+  const windowPortableDirectory = await createTemporaryDirectory('vexa-window-portable-')
+  executable = resolve(windowPortableDirectory, 'vexa.exe')
+  await copyFile(sourceExecutable, executable)
+  const windowDataDirectory = resolve(windowPortableDirectory, 'Data')
+  await mkdir(windowDataDirectory)
+  const windowSettingsPath = resolve(windowDataDirectory, 'settings.json')
+  await writeFile(windowSettingsPath, JSON.stringify({
+    version: 1,
+    appearance: { theme: 'dark', fontSize: 'small', sourceFontSize: 18 },
+    historyLimit: 5000,
+  }, null, 2))
+
+  let windowPage = await startPortableApp(windowPortableDirectory)
+  assert.equal(await windowPage.locator('.app-shell').getAttribute('data-theme'), 'dark')
+  const firstNativeBounds = await controlNativeWindow({ x: 180, y: 120, width: 1320, height: 900, mode: 'burst' })
+  const normalWindowSettings = await waitForSettings(windowSettingsPath, (settings) => settings.window?.maximized === false && Math.abs(settings.window.x / settings.window.scaleFactor - firstNativeBounds.x) <= 12 && Math.abs(settings.window.y / settings.window.scaleFactor - firstNativeBounds.y) <= 12)
+  assert(normalWindowSettings.window.width >= 900)
+  assert(normalWindowSettings.window.height >= 620)
+  assert(Math.abs(firstNativeBounds.x - normalWindowSettings.window.x / normalWindowSettings.window.scaleFactor) <= 12)
+  assert(Math.abs(firstNativeBounds.y - normalWindowSettings.window.y / normalWindowSettings.window.scaleFactor) <= 12)
+  assert.equal(normalWindowSettings.appearance.theme, 'dark')
+  assert.equal(normalWindowSettings.appearance.fontSize, 'small')
+  assert.equal(normalWindowSettings.appearance.sourceFontSize, 18)
+  assert.equal(normalWindowSettings.historyLimit, 5000)
+  await browser.close().catch(() => undefined)
+  browser = undefined
+  await stopApp()
+
+  const windowCopyDirectory = await createTemporaryDirectory('vexa-window-copy-')
+  await cp(windowPortableDirectory, windowCopyDirectory, { recursive: true })
+  const copiedSettingsPath = resolve(windowCopyDirectory, 'Data', 'settings.json')
+  windowPage = await startPortableApp(windowCopyDirectory)
+  const copiedBounds = await controlNativeWindow()
+  assert(!copiedBounds.maximized, 'copied portable settings should reopen as a normal window')
+  assert(Math.abs(copiedBounds.x - firstNativeBounds.x) <= 10)
+  assert(Math.abs(copiedBounds.y - firstNativeBounds.y) <= 10)
+  assert(Math.abs(copiedBounds.width - firstNativeBounds.width) <= 20)
+  assert(Math.abs(copiedBounds.height - firstNativeBounds.height) <= 20)
+
+  await controlNativeWindow({ mode: 'maximize' })
+  const maximizedSettings = await waitForSettings(copiedSettingsPath, (settings) => settings.window?.maximized === true)
+  assert.deepEqual(
+    [maximizedSettings.window.x, maximizedSettings.window.y, maximizedSettings.window.width, maximizedSettings.window.height],
+    [normalWindowSettings.window.x, normalWindowSettings.window.y, normalWindowSettings.window.width, normalWindowSettings.window.height],
+    'maximized bounds must not replace the last normal geometry',
+  )
+  await browser.close().catch(() => undefined)
+  browser = undefined
+  await stopApp()
+
+  windowPage = await startPortableApp(windowCopyDirectory)
+  const reopenedMaximizedBounds = await controlNativeWindow()
+  assert(reopenedMaximizedBounds.maximized, 'the actual Release EXE should reopen maximized')
+  await controlNativeWindow({ mode: 'restore' })
+  const restoredNormalSettings = await waitForSettings(copiedSettingsPath, (settings) => settings.window?.maximized === false)
+  assert.deepEqual(
+    [restoredNormalSettings.window.x, restoredNormalSettings.window.y, restoredNormalSettings.window.width, restoredNormalSettings.window.height],
+    [normalWindowSettings.window.x, normalWindowSettings.window.y, normalWindowSettings.window.width, normalWindowSettings.window.height],
+    'restoring from maximized should keep the previous normal geometry',
+  )
+  await browser.close().catch(() => undefined)
+  browser = undefined
+  await stopApp()
+
+  windowPage = await startPortableApp(windowCopyDirectory)
+  const reopenedNormalBounds = await controlNativeWindow()
+  assert(!reopenedNormalBounds.maximized, 'the actual Release EXE should reopen in its last normal state')
+  assert(Math.abs(reopenedNormalBounds.x - firstNativeBounds.x) <= 10)
+  assert(Math.abs(reopenedNormalBounds.y - firstNativeBounds.y) <= 10)
+  assert(Math.abs(reopenedNormalBounds.width - firstNativeBounds.width) <= 20)
+  assert(Math.abs(reopenedNormalBounds.height - firstNativeBounds.height) <= 20)
+  const finalWindowSettings = JSON.parse(await readFile(copiedSettingsPath, 'utf8'))
+  assert.equal(finalWindowSettings.appearance.theme, 'dark')
+  assert.equal(finalWindowSettings.appearance.fontSize, 'small')
+  assert.equal(finalWindowSettings.appearance.sourceFontSize, 18)
+  assert.equal(finalWindowSettings.historyLimit, 5000)
+  console.log('PASS Release EXE/WebView2：視窗移動、尺寸、Portable 複製、最大化/還原及 UI 偏好保存')
 
   await browser.close().catch(() => undefined)
   browser = undefined
