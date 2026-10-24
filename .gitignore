@@ -19,6 +19,9 @@ dist-ssr/
 coverage/
 .vite/
 *.tsbuildinfo
+test-results/
+playwright-report/
+output/playwright/
 
 # ----------------------------------------
 # Rust / Cargo Build

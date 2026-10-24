@@ -1,0 +1,26 @@
+[package]
+name = "vexa"
+version = "0.2.0"
+description = "A lightweight local HTTP client"
+authors = ["Vexa"]
+edition = "2021"
+
+[lib]
+name = "vexa_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+base64 = "0.22"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "charset", "gzip", "brotli", "deflate", "zstd", "multipart", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-dialog = "2"
+tokio = { version = "1", features = ["fs", "macros", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+url = "2"

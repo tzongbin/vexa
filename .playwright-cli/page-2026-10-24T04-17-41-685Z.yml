@@ -1,0 +1,75 @@
+- main [ref=f1e3]:
+  - generic [ref=f1e4]:
+    - generic [ref=f1e5]:
+      - generic [ref=f1e6]: V
+      - generic [ref=f1e7]: Vexa
+    - navigation "Request Tabs" [ref=f1e8]:
+      - button "GET /first 關閉 Tab" [ref=f1e116] [cursor=pointer]:
+        - generic [ref=f1e86]: GET /first
+        - button "關閉 Tab" [ref=f1e87]: ×
+      - button "GET 新請求 關閉 Tab" [ref=f1e117] [cursor=pointer]:
+        - generic [ref=f1e119]: GET 新請求
+        - button "關閉 Tab" [ref=f1e120]: ×
+    - button "新增 Tab" [ref=f1e13] [cursor=pointer]: ＋
+    - generic [ref=f1e15]: 本機
+    - button "◐" [ref=f1e17] [cursor=pointer]
+  - generic [ref=f1e18]:
+    - combobox "HTTP Method" [ref=f1e19]:
+      - option "GET" [selected]
+      - option "POST"
+      - option "PUT"
+      - option "PATCH"
+      - option "DELETE"
+      - option "HEAD"
+      - option "OPTIONS"
+    - textbox "Request URL" [ref=f1e20]:
+      - /placeholder: 輸入 URL，例如 https://api.example.com/v1/items
+    - button "➤ Send Ctrl ↵" [ref=f1e21] [cursor=pointer]:
+      - generic [ref=f1e22]: ➤
+      - text: Send
+      - generic [ref=f1e23]: Ctrl ↵
+  - generic [ref=f1e24]:
+    - region "Request 編輯器" [ref=f1e25]:
+      - generic [ref=f1e26]:
+        - heading "Request" [level=1] [ref=f1e29]
+        - generic [ref=f1e30]:
+          - text: Timeout
+          - spinbutton "Timeout 毫秒" [ref=f1e31]: "30000"
+          - text: ms
+      - generic [ref=f1e32]:
+        - button "Params" [ref=f1e33] [cursor=pointer]
+        - button "Headers" [ref=f1e138] [cursor=pointer]
+        - button "Auth" [ref=f1e35] [cursor=pointer]
+        - button "Body" [active] [ref=f1e36] [cursor=pointer]
+      - generic [ref=f1e139]:
+        - generic [ref=f1e146]:
+          - generic [ref=f1e147]:
+            - heading "Request Body" [level=2] [ref=f1e148]
+            - paragraph [ref=f1e149]: 依照內容類型自動設定 Content-Type，可用自訂 Header 覆寫。
+          - combobox [ref=f1e150]:
+            - option "None" [selected]
+            - option "JSON"
+            - option "Text"
+            - option "Form URL Encoded"
+            - option "Multipart Form Data"
+        - generic [ref=f1e151]:
+          - generic [ref=f1e152]: "{ }"
+          - paragraph [ref=f1e153]: 此 Request 不會傳送 Body。
+    - separator "調整 Request 與 Response 寬度" [ref=f1e44]
+    - region "Response 檢視器" [ref=f1e46]:
+      - heading "Response" [level=1] [ref=f1e50]
+      - generic [ref=f1e51]: 尚未傳送 Request
+      - generic [ref=f1e53]:
+        - generic [ref=f1e54]: ←
+        - heading "Response 將顯示於此" [level=2] [ref=f1e57]
+        - paragraph [ref=f1e58]: 輸入網址並按下 Send，查看回應內容。
+  - generic [ref=f1e59]:
+    - generic [ref=f1e60]:
+      - text: Vexa v0.1.0
+      - generic [ref=f1e62]: ·
+      - text: HTTP requests run locally
+    - generic [ref=f1e63]:
+      - text: GET
+      - generic [ref=f1e64]: ·
+      - text: 2 Tabs
+      - generic [ref=f1e65]: Ctrl T 新增 Ctrl W 關閉 Esc 取消

@@ -7,7 +7,7 @@ Vexa 是 **Local-first、輕量、跨平台的桌面 HTTP/API 測試工具**。�
 - 專案目錄：`D:\Dropbox\_prg\_Vexa\`
 - 優先平台：Windows 10 / 11、Windows Server 2016（須在實機或對應環境驗證）
 - 未來保留 Linux / macOS 相容性，不為尚未需要的平台加入額外複雜度。
-- 技術：Tauri 2、Vue 3、TypeScript、Rust、SQLite。
+- 技術：Tauri 2、Vue 3、TypeScript、Rust；Portable JSON 保存設定、History 與 Session，不使用 SQLite。
 - 介面：桌面大畫面優先，Request 與 Response 左右分割，分割比例可調整。
 - 發布：Portable 優先、盡可能單一 EXE；Windows 需留意 WebView2 Runtime。不得宣稱所有環境均完全無相依。
 
@@ -49,33 +49,38 @@ Vexa 是 **Local-first、輕量、跨平台的桌面 HTTP/API 測試工具**。�
 - **Tab 的 Response 只保留於當次執行記憶體，不跨重啟還原。**
 - 關閉最後一個 Tab 時建立空白 Tab。
 - 對於尚在執行的 Request，須有一致的取消、關閉或完成結果處理方式。
+- Tab Bar 的清單可水平捲動，右側本機/主題/設定工具固定，不因 Tab 數量換行或被擠壓；新增及切換 Tab 時自動捲動至可見範圍。
+- Session 保存 Tab Request 與順序/選取狀態；一般 Tab 的 Response 不跨重啟保存。
 
 ### 3.4 History
 
-- 每次發送請求建立獨立的執行記錄，包括失敗與逾時情境；不可因 URL 相同而覆寫。
-- 使用 SQLite 儲存 History，記錄時間、Method、URL、Request 快照、Status / 錯誤、耗時、Response 大小與允許保存的內容。
-- **預設最多 1,000 筆**，可在設定中調整；超過上限時淘汰最舊記錄，避免無限累積。
-- History 的 Response Body **預設保存上限 1 MB/筆**；超過上限只保留中繼資料，並清楚標示未保存 Body。
-- 另有適當的資料總容量保護，防止大量記錄與快照造成資料無限制膨脹；上限與清理策略應保持簡單、可預期。
-- 提供快速清除全部 History 與指定範圍清除；清除不影響目前開啟的 Tabs。
-- History 項目點選後在**新 Tab** 還原 Request 與已保存的 Response；**不得自動重新送出**，尤其避免誤觸有副作用的 POST/PUT/PATCH/DELETE。
-- History 可搜尋、依時間顯示；不實作 Collection 或其他管理層。
-- SQLite 清理應採交易與合理的空間回收策略；避免在每筆新增後執行昂貴的完整 VACUUM。
+- 每次開始 Request 執行建立獨立記錄；相同 URL 不覆寫，且可在該 Request 停用記錄。
+- History 保存於 EXE 同目錄 `Data/history.json`，只保存執行時間與 Request 快照；不保存 Response Body、Headers、Status 或耗時。
+- **預設最多 1,000 筆**，可選 100、500、1,000、5,000、10,000；超過上限立即淘汰最舊記錄。
+- History 支援 URL 搜尋、Method 篩選、日期分組、分批顯示，以及清除全部/今天/7 天以前/30 天以前。
+- 清除 History 不影響目前開啟的 Tabs。
+- History 項目點選後在**新 Tab**還原 Request；Response 為空且**不得自動重新送出**。若該 History 已開啟，優先切換到原 Tab。
+- 不實作 Collection 或其他 API 管理層。
+
+### 3.5 Session
+
+- 使用 EXE 同目錄 `Data/session.json` 自動保存 Tab 順序、目前選取 Tab 與 Request 設定；採 Debounce，避免每個字元都寫檔。
+- 重啟時還原 Tabs 與 Request，所有 Response 皆為空白；關閉最後一個 Tab 時建立空白 Tab。
+- Session 與 History 使用版本欄位、格式驗證、原子替換與寫入序列化；損壞檔案保留原樣並提示，不得阻止啟動。
 
 ## 4. 資料儲存與敏感資訊
 
-- SQLite 是 Tab/Request 設定與 History 的主要儲存機制；資料庫名稱建議 `vexa.db`。
+- Portable JSON 是設定、History 與 Session 的儲存機制：`Data/settings.json`、`Data/history.json`、`Data/session.json`。正式路徑以 EXE 所在目錄為準。
 - Portable 資料目錄以程式所在目錄的 `Data` 為目標，但必須處理不可寫入、權限不足及多程序同時開啟等情況；不得默默遺失資料。
-- 資料庫結構須可升級；採具版本的 Migration 或等價機制，避免破壞既有使用者資料。
-- 使用交易、適當 busy timeout 與資料完整性檢查，避免非正常結束造成不一致。
-- **不可把 Token、Password、API Key、Authorization、Cookie 當作普通明文設定無條件保存。** 定義遮罩、排除或受保護儲存策略，並明確處理重新啟動後需要重新輸入秘密值的情境。
-- History 中的 Body 也可能包含秘密資料；不得宣稱只遮罩 Header 就能完全保護敏感資訊。
+- JSON 檔案須具版本、格式驗證、原子替換與序列化寫入；損壞時保留原始檔並提示，不可因此崩潰。
+- **不可把 Token、Password、API Key、Authorization、Cookie 當作普通明文無條件保存。** History/Session 遮罩常見秘密 Header、Query 參數與欄位；Auth 秘密值不保存，還原後提醒並要求使用者確認才可送出。
+- Body 預設不保存；使用者可逐 Request 明確允許保存。常見密碼類表單欄位仍遮罩，Multipart 檔案路徑永不保存。JSON/Text 任意內容無法可靠辨識所有秘密值，UI 必須說明此限制。
 - 不向外部服務傳送使用者 Request、Response 或診斷資料，除非使用者明確要求送往其指定目標 API。
 
 ## 5. 架構與程式品質
 
 - 前端：Vue 3 Composition API、TypeScript strict；保持狀態與 UI 元件職責清楚。
-- 後端：Rust 負責 HTTP、I/O、SQLite 及平台整合；UI 不直接實作目標 API 傳輸。
+- 後端：Rust 負責 HTTP、JSON I/O 及平台整合；UI 不直接實作目標 API 傳輸或任意檔案存取。
 - Request、Response、Tab 與 History 的模型分離；History 是不可隨當前編輯內容變動的執行快照。
 - 每次非同步請求以穩定 Tab ID / Request execution ID 關聯，防止切換頁籤、重送與取消時競態。
 - 正確處理 Redirect、壓縮回應、Content-Type / Charset、二進位、網路失敗、TLS 驗證錯誤及 Timeout。
